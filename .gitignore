@@ -1,0 +1,51 @@
+# CMake build directories
+/build/
+/build-*/
+/cmake-build-*/
+
+# In-source CMake generated files
+/CMakeFiles/
+/CMakeCache.txt
+/CTestTestfile.cmake
+/DartConfiguration.tcl
+/Makefile
+/cmake_install.cmake
+/Testing/
+
+# Build products
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+/AudioProcessingModule
+/audio_processing_module_tests
+
+# Runtime output from system tests
+/output/
+/logs/
+/tmp/
+*.sock
+*.log
+core
+core.*
+
+# Generated audio output. Test input fixtures such as tests/aec_2ch_16k.s16
+# are intentionally not ignored.
+*.wav
+!tests/**/*.wav
+
+# Local IDE and OS metadata
+/.cache/
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local CMake/user tooling
+/compile_commands.json
+/CMakeUserPresets.json
