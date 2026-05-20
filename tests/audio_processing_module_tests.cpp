@@ -7,10 +7,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using audio_processing_module::AudioFormat;
@@ -39,6 +41,50 @@ T ReadLittleEndian(const std::vector<uint8_t>& bytes, size_t offset) {
     value |= static_cast<T>(bytes.at(offset + index)) << (8 * index);
   }
   return value;
+}
+
+class ScopedCurrentPath {
+ public:
+  explicit ScopedCurrentPath(const std::filesystem::path& path)
+      : previous_(std::filesystem::current_path()) {
+    std::filesystem::current_path(path);
+  }
+
+  ~ScopedCurrentPath() {
+    std::filesystem::current_path(previous_);
+  }
+
+  ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+  ScopedCurrentPath& operator=(const ScopedCurrentPath&) = delete;
+
+ private:
+  std::filesystem::path previous_;
+};
+
+std::filesystem::path MakeTempDirectory(const std::string& suffix) {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("audio_processing_module_test_" + suffix + "_" +
+       std::to_string(static_cast<long>(::getpid())));
+  std::filesystem::remove_all(path);
+  std::filesystem::create_directories(path);
+  return path;
+}
+
+void WriteConfigFile(const std::filesystem::path& path, const std::string& body) {
+  const std::filesystem::path parent = path.parent_path();
+  if (!parent.empty()) {
+    std::filesystem::create_directories(parent);
+  }
+
+  std::ofstream output(path);
+  Require(output.good(), "failed to open config file for writing");
+  output << body;
+  Require(output.good(), "failed to write config file");
+}
+
+bool StartsWith(const std::string& value, const std::string& prefix) {
+  return value.rfind(prefix, 0) == 0;
 }
 
 void TestStereoFrameSplitKeepsMicAndReferenceOrder() {
@@ -82,33 +128,124 @@ void TestWavWriterPatchesHeaderAfterStreamingSamples() {
   Require(ReadLittleEndian<uint32_t>(bytes, 40) == 8, "wav data chunk size should match samples");
 }
 
-void TestParseOptionsAcceptsAec3TuningParameters() {
-  // 验证系统测试可以通过命令行稳定指定 AEC3 delay、AEC 前自动增益、NS 与 AGC 参数。
+void TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory() {
+  // 验证未指定配置参数时，程序会在当前工作目录生成 apm.yaml，并使用默认配置启动。
+  const std::filesystem::path original_input =
+      std::filesystem::absolute("tests/aec_2ch_16k.s16");
+  const std::filesystem::path temp_root = MakeTempDirectory("cwd");
+  ScopedCurrentPath current_path_guard(temp_root);
+
   const std::vector<std::string> args = {
       "AudioProcessingModule",
-      "--input", "tests/aec_2ch_16k.s16",
-      "--delay-ms", "32",
-      "--pre-aec-auto-gain-target-rms", "2400",
-      "--pre-aec-auto-gain-max", "6.5",
-      "--ns-level", "very-high",
-      "--agc-mode", "adaptive-digital",
-      "--agc-target-dbfs", "4",
-      "--agc-compression-gain-db", "12",
+      "--input", original_input.string(),
   };
 
   const auto options = ParseOptions(args);
 
-  Require(options.processor.delay_ms == 32, "delay_ms was not parsed");
-  Require(std::abs(options.processor.pre_aec_auto_gain.target_rms - 2400.0f) < 0.01f,
-          "pre-aec target rms was not parsed");
-  Require(std::abs(options.processor.pre_aec_auto_gain.max_gain - 6.5f) < 0.01f,
-          "pre-aec max gain was not parsed");
-  Require(options.processor.ns_level == WebRtcProcessorOptions::NoiseSuppressionLevel::kVeryHigh,
-          "ns level was not parsed");
+  Require(std::filesystem::exists(temp_root / "apm.yaml"),
+          "default config file was not created in cwd");
+  Require(StartsWith(options.socket_dir, "/tmp/audio_processing_module_"),
+          "default socket dir was not loaded from generated config");
+  Require(options.processor.delay_ms == 0, "default delay_ms should remain zero");
+  Require(options.processor.ns_level == WebRtcProcessorOptions::NoiseSuppressionLevel::kHigh,
+          "default ns level should remain high");
   Require(options.processor.agc_mode == WebRtcProcessorOptions::AgcMode::kAdaptiveDigital,
-          "agc mode was not parsed");
-  Require(options.processor.agc_target_level_dbfs == 4, "agc target was not parsed");
-  Require(options.processor.agc_compression_gain_db == 12, "agc compression was not parsed");
+          "default agc mode should remain adaptive digital");
+}
+
+void TestParseOptionsLoadsConfigurationFromDirectory() {
+  // 验证传入配置文件夹时，会默认读取其中的 apm.yaml 并应用文件里的配置。
+  const std::filesystem::path temp_root = MakeTempDirectory("dir");
+  const std::filesystem::path config_dir = temp_root / "config";
+  const std::filesystem::path config_file = config_dir / "apm.yaml";
+  const std::filesystem::path input_file = std::filesystem::absolute("tests/aec_2ch_16k.s16");
+  WriteConfigFile(config_file,
+                  "socket_dir: \"" + (temp_root / "sockets").string() + "\"\n"
+                  "delay_ms: 32\n"
+                  "pre_aec_auto_gain:\n"
+                  "  enabled: false\n"
+                  "  target_rms: 1800\n"
+                  "  max_gain: 4.5\n"
+                  "  attack: 0.5\n"
+                  "  release: 0.25\n"
+                  "ns_level: very-high\n"
+                  "agc_mode: fixed-digital\n"
+                  "agc_target_dbfs: 4\n"
+                  "agc_compression_gain_db: 12\n"
+                  "agc_limiter_enabled: false\n");
+
+  const std::vector<std::string> args = {
+      "AudioProcessingModule",
+      "--config", config_dir.string(),
+      "--input", input_file.string(),
+  };
+
+  const auto options = ParseOptions(args);
+
+  Require(options.socket_dir == (temp_root / "sockets").string(),
+          "socket dir was not loaded from config file");
+  Require(options.processor.delay_ms == 32, "delay_ms was not loaded from config file");
+  Require(!options.processor.pre_aec_auto_gain.enabled,
+          "pre-aec auto gain enable flag was not loaded");
+  Require(std::abs(options.processor.pre_aec_auto_gain.target_rms - 1800.0f) < 0.01f,
+          "pre-aec target rms was not loaded");
+  Require(std::abs(options.processor.pre_aec_auto_gain.max_gain - 4.5f) < 0.01f,
+          "pre-aec max gain was not loaded");
+  Require(std::abs(options.processor.pre_aec_auto_gain.attack - 0.5f) < 0.01f,
+          "pre-aec attack was not loaded");
+  Require(std::abs(options.processor.pre_aec_auto_gain.release - 0.25f) < 0.01f,
+          "pre-aec release was not loaded");
+  Require(options.processor.ns_level == WebRtcProcessorOptions::NoiseSuppressionLevel::kVeryHigh,
+          "ns level was not loaded");
+  Require(options.processor.agc_mode == WebRtcProcessorOptions::AgcMode::kFixedDigital,
+          "agc mode was not loaded");
+  Require(options.processor.agc_target_level_dbfs == 4, "agc target was not loaded");
+  Require(options.processor.agc_compression_gain_db == 12, "agc compression was not loaded");
+  Require(!options.processor.agc_limiter_enabled, "agc limiter was not loaded");
+}
+
+void TestParseOptionsCreatesConfigFileAtExplicitYamlPath() {
+  // 验证传入配置文件绝对路径时，程序会直接在该路径创建 apm.yaml 并使用默认配置。
+  const std::filesystem::path temp_root = MakeTempDirectory("file");
+  const std::filesystem::path config_file = temp_root / "custom-apm.yaml";
+  const std::filesystem::path input_file = std::filesystem::absolute("tests/aec_2ch_16k.s16");
+
+  const std::vector<std::string> args = {
+      "AudioProcessingModule",
+      "--config", config_file.string(),
+      "--input", input_file.string(),
+  };
+
+  const auto options = ParseOptions(args);
+
+  Require(std::filesystem::exists(config_file),
+          "explicit config file path was not created");
+  Require(StartsWith(options.socket_dir, "/tmp/audio_processing_module_"),
+          "generated config should still use default socket dir");
+
+  std::ifstream input(config_file);
+  const std::string body((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+  Require(body.find("pre_aec_auto_gain:\n") != std::string::npos,
+          "generated config should use nested pre-aec auto gain yaml");
+}
+
+void TestParseOptionsRejectsRemovedTuningFlags() {
+  // 验证原来直接从命令行传入的调参项已经被移除，并会提示改用配置文件。
+  const std::vector<std::string> args = {
+      "AudioProcessingModule",
+      "--input", "tests/aec_2ch_16k.s16",
+      "--delay-ms", "32",
+  };
+
+  bool failed = false;
+  try {
+    (void)ParseOptions(args);
+  } catch (const std::exception& error) {
+    failed = std::string(error.what()).find("config") != std::string::npos;
+  }
+
+  Require(failed, "removed tuning flags should be rejected with a config-file hint");
 }
 
 void TestPreAecAutoGainRaisesSmallMicFrameWithoutClipping() {
@@ -146,7 +283,10 @@ int main() {
   try {
     TestStereoFrameSplitKeepsMicAndReferenceOrder();
     TestWavWriterPatchesHeaderAfterStreamingSamples();
-    TestParseOptionsAcceptsAec3TuningParameters();
+    TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory();
+    TestParseOptionsLoadsConfigurationFromDirectory();
+    TestParseOptionsCreatesConfigFileAtExplicitYamlPath();
+    TestParseOptionsRejectsRemovedTuningFlags();
     TestPreAecAutoGainRaisesSmallMicFrameWithoutClipping();
   } catch (const std::exception& error) {
     std::cerr << "Test failed: " << error.what() << '\n';

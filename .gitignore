@@ -23,6 +23,13 @@
 /AudioProcessingModule
 /audio_processing_module_tests
 
+# Generated third-party source, build, tool, and install trees. Release archives
+# and the downloads manifest under third_party are tracked.
+/third_party/build/
+/third_party/install/
+/third_party/src/
+/third_party/tools/
+
 # Runtime output from system tests
 /output/
 /logs/
@@ -49,3 +56,5 @@ core.*
 # Local CMake/user tooling
 /compile_commands.json
 /CMakeUserPresets.json
+
+/.codex

@@ -17,7 +17,11 @@ int main(int argc, char** argv) {
         audio_processing_module::ParseOptions(args);
     return audio_processing_module::RunPipeline(options);
   } catch (const std::exception& error) {
-    std::cerr << error.what() << '\n';
+    const std::string message = error.what();
+    std::cerr << message << '\n';
+    if (message.rfind("Usage:", 0) == 0) {
+      return 0;
+    }
     if (argc > 0) {
       std::cerr << audio_processing_module::Usage(argv[0]);
     }
