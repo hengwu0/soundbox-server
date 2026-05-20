@@ -1,6 +1,7 @@
 #include "audio_processing_module/application.hpp"
 
 #include "audio_processing_module/modules.hpp"
+#include "audio_processing_module/webrtc_processor.hpp"
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -24,6 +25,59 @@ std::string RequireValue(const std::vector<std::string>& args, size_t& index) {
   }
   ++index;
   return args[index];
+}
+
+int ParseInt(const std::string& value, const std::string& option_name) {
+  try {
+    size_t parsed = 0;
+    const int result = std::stoi(value, &parsed);
+    if (parsed != value.size()) {
+      throw std::invalid_argument("trailing characters");
+    }
+    return result;
+  } catch (const std::exception&) {
+    throw std::runtime_error("invalid integer for " + option_name + ": " + value);
+  }
+}
+
+float ParseFloat(const std::string& value, const std::string& option_name) {
+  try {
+    size_t parsed = 0;
+    const float result = std::stof(value, &parsed);
+    if (parsed != value.size()) {
+      throw std::invalid_argument("trailing characters");
+    }
+    return result;
+  } catch (const std::exception&) {
+    throw std::runtime_error("invalid float for " + option_name + ": " + value);
+  }
+}
+
+WebRtcProcessorOptions::NoiseSuppressionLevel ParseNoiseSuppressionLevel(
+    const std::string& value) {
+  if (value == "low") {
+    return WebRtcProcessorOptions::NoiseSuppressionLevel::kLow;
+  }
+  if (value == "moderate") {
+    return WebRtcProcessorOptions::NoiseSuppressionLevel::kModerate;
+  }
+  if (value == "high") {
+    return WebRtcProcessorOptions::NoiseSuppressionLevel::kHigh;
+  }
+  if (value == "very-high") {
+    return WebRtcProcessorOptions::NoiseSuppressionLevel::kVeryHigh;
+  }
+  throw std::runtime_error("invalid --ns-level: " + value);
+}
+
+WebRtcProcessorOptions::AgcMode ParseAgcMode(const std::string& value) {
+  if (value == "adaptive-digital") {
+    return WebRtcProcessorOptions::AgcMode::kAdaptiveDigital;
+  }
+  if (value == "fixed-digital") {
+    return WebRtcProcessorOptions::AgcMode::kFixedDigital;
+  }
+  throw std::runtime_error("invalid --agc-mode: " + value);
 }
 
 std::string DefaultSocketDir() {
@@ -53,6 +107,27 @@ PipelineOptions ParseOptions(const std::vector<std::string>& args) {
       options.output_file = RequireValue(args, index);
     } else if (arg == "--socket-dir") {
       options.socket_dir = RequireValue(args, index);
+    } else if (arg == "--delay-ms") {
+      options.processor.delay_ms = ParseInt(RequireValue(args, index), arg);
+    } else if (arg == "--pre-aec-auto-gain-target-rms") {
+      options.processor.pre_aec_auto_gain.target_rms =
+          ParseFloat(RequireValue(args, index), arg);
+    } else if (arg == "--pre-aec-auto-gain-max") {
+      options.processor.pre_aec_auto_gain.max_gain =
+          ParseFloat(RequireValue(args, index), arg);
+    } else if (arg == "--disable-pre-aec-auto-gain") {
+      options.processor.pre_aec_auto_gain.enabled = false;
+    } else if (arg == "--ns-level") {
+      options.processor.ns_level =
+          ParseNoiseSuppressionLevel(RequireValue(args, index));
+    } else if (arg == "--agc-mode") {
+      options.processor.agc_mode = ParseAgcMode(RequireValue(args, index));
+    } else if (arg == "--agc-target-dbfs") {
+      options.processor.agc_target_level_dbfs =
+          ParseInt(RequireValue(args, index), arg);
+    } else if (arg == "--agc-compression-gain-db") {
+      options.processor.agc_compression_gain_db =
+          ParseInt(RequireValue(args, index), arg);
     } else if (arg == "--help" || arg == "-h") {
       throw std::runtime_error(Usage(args.empty() ? "AudioProcessingModule" : args[0]));
     } else {
@@ -71,7 +146,14 @@ std::string Usage(const std::string& program_name) {
   std::ostringstream output;
   output << "Usage: " << program_name
          << " --input <2ch_16bit_16k.s16> [--output <processed.wav>]"
-         << " [--socket-dir <dir>]\n";
+         << " [--socket-dir <dir>] [--delay-ms <ms>]"
+         << " [--pre-aec-auto-gain-target-rms <rms>]"
+         << " [--pre-aec-auto-gain-max <factor>]"
+         << " [--disable-pre-aec-auto-gain]"
+         << " [--ns-level low|moderate|high|very-high]"
+         << " [--agc-mode adaptive-digital|fixed-digital]"
+         << " [--agc-target-dbfs <dbfs>]"
+         << " [--agc-compression-gain-db <db>]\n";
   return output.str();
 }
 
@@ -83,7 +165,8 @@ int RunPipeline(const PipelineOptions& options) {
       (std::filesystem::path(options.socket_dir) / "processed.sock").string();
 
   ModuleAFileSource module_a(options.input_file, capture_socket);
-  ModuleBWebRtcProcessor module_b(capture_socket, processed_socket);
+  ModuleBWebRtcProcessor module_b(capture_socket, processed_socket,
+                                  options.processor);
   ModuleCWavSink module_c(processed_socket, options.output_file);
 
   std::vector<std::exception_ptr> errors(3);

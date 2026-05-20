@@ -1,55 +1,130 @@
 #include "audio_processing_module/webrtc_processor.hpp"
 
-#include "webrtc/common.h"
-#include "webrtc/modules/audio_processing/include/audio_processing.h"
-#include "webrtc/modules/interface/module_common_types.h"
+#include "modules/audio_processing/include/audio_processing.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
 namespace audio_processing_module {
+namespace {
 
-WebRtcProcessor::WebRtcProcessor() {
-  webrtc::Config config;
-  config.Set<webrtc::ExtendedFilter>(new webrtc::ExtendedFilter(true));
-  config.Set<webrtc::DelayAgnostic>(new webrtc::DelayAgnostic(true));
+webrtc::AudioProcessing::Config::NoiseSuppression::Level ToWebRtcNsLevel(
+    WebRtcProcessorOptions::NoiseSuppressionLevel level) {
+  using WebRtcLevel = webrtc::AudioProcessing::Config::NoiseSuppression::Level;
+  switch (level) {
+    case WebRtcProcessorOptions::NoiseSuppressionLevel::kLow:
+      return WebRtcLevel::kLow;
+    case WebRtcProcessorOptions::NoiseSuppressionLevel::kModerate:
+      return WebRtcLevel::kModerate;
+    case WebRtcProcessorOptions::NoiseSuppressionLevel::kHigh:
+      return WebRtcLevel::kHigh;
+    case WebRtcProcessorOptions::NoiseSuppressionLevel::kVeryHigh:
+      return WebRtcLevel::kVeryHigh;
+  }
+  return WebRtcLevel::kHigh;
+}
 
-  apm_.reset(webrtc::AudioProcessing::Create(config));
+webrtc::AudioProcessing::Config::GainController1::Mode ToWebRtcAgcMode(
+    WebRtcProcessorOptions::AgcMode mode) {
+  using WebRtcMode = webrtc::AudioProcessing::Config::GainController1::Mode;
+  switch (mode) {
+    case WebRtcProcessorOptions::AgcMode::kAdaptiveDigital:
+      return WebRtcMode::kAdaptiveDigital;
+    case WebRtcProcessorOptions::AgcMode::kFixedDigital:
+      return WebRtcMode::kFixedDigital;
+  }
+  return WebRtcMode::kAdaptiveDigital;
+}
+
+int16_t ClampToS16(float value) {
+  const auto rounded = static_cast<int32_t>(std::lround(value));
+  return static_cast<int16_t>(std::max(-32768, std::min(32767, rounded)));
+}
+
+}  // namespace
+
+float ComputeRms(const std::vector<int16_t>& samples) {
+  if (samples.empty()) {
+    return 0.0f;
+  }
+
+  double energy = 0.0;
+  for (const int16_t sample : samples) {
+    const double value = static_cast<double>(sample);
+    energy += value * value;
+  }
+  return static_cast<float>(std::sqrt(energy / static_cast<double>(samples.size())));
+}
+
+void ProcessPreAecAutoGain(std::vector<int16_t>* samples,
+                           const PreAecAutoGainConfig& config,
+                           AutomaticGainState* state) {
+  if (!samples || !state || samples->empty() || !config.enabled) {
+    return;
+  }
+
+  const float rms = ComputeRms(*samples);
+  const float safe_target = std::max(1.0f, config.target_rms);
+  const float safe_max_gain = std::max(1.0f, config.max_gain);
+  float desired_gain = safe_max_gain;
+  if (rms > 1.0f) {
+    desired_gain = safe_target / rms;
+  }
+  desired_gain = std::max(1.0f, std::min(safe_max_gain, desired_gain));
+
+  const float smoothing =
+      (desired_gain > state->current_gain) ? config.attack : config.release;
+  const float bounded_smoothing = std::max(0.0f, std::min(1.0f, smoothing));
+  state->current_gain =
+      state->current_gain +
+      (desired_gain - state->current_gain) * bounded_smoothing;
+  state->current_gain = std::max(1.0f, std::min(safe_max_gain, state->current_gain));
+
+  if (state->current_gain >= 0.999f && state->current_gain <= 1.001f) {
+    return;
+  }
+
+  for (int16_t& sample : *samples) {
+    sample = ClampToS16(static_cast<float>(sample) * state->current_gain);
+  }
+}
+
+WebRtcProcessor::WebRtcProcessor(WebRtcProcessorOptions options)
+    : options_(options) {
+  webrtc::AudioProcessingBuilder builder;
+  apm_.reset(builder.Create());
   if (!apm_) {
     throw std::runtime_error("failed to create WebRTC AudioProcessing module");
   }
 
-  CheckWebRtcResult(
-      apm_->Initialize(kSampleRateHz, kSampleRateHz, kSampleRateHz,
-                       webrtc::AudioProcessing::kMono,
-                       webrtc::AudioProcessing::kMono,
-                       webrtc::AudioProcessing::kMono),
-      "AudioProcessing::Initialize");
+  webrtc::AudioProcessing::Config config;
+  config.echo_canceller.enabled = true;
+  config.echo_canceller.mobile_mode = false;
+  config.echo_canceller.enforce_high_pass_filtering = true;
+  config.high_pass_filter.enabled = true;
+  config.noise_suppression.enabled = true;
+  config.noise_suppression.level = ToWebRtcNsLevel(options_.ns_level);
+  config.gain_controller1.enabled = true;
+  config.gain_controller1.mode = ToWebRtcAgcMode(options_.agc_mode);
+  config.gain_controller1.target_level_dbfs = options_.agc_target_level_dbfs;
+  config.gain_controller1.compression_gain_db = options_.agc_compression_gain_db;
+  config.gain_controller1.enable_limiter = options_.agc_limiter_enabled;
+  config.gain_controller1.analog_gain_controller.enabled = false;
+  config.gain_controller2.enabled = false;
+  apm_->ApplyConfig(config);
 
-  CheckWebRtcResult(apm_->high_pass_filter()->Enable(true),
-                    "HighPassFilter::Enable");
-  CheckWebRtcResult(apm_->echo_cancellation()->enable_drift_compensation(false),
-                    "EchoCancellation::enable_drift_compensation");
-  CheckWebRtcResult(
-      apm_->echo_cancellation()->set_suppression_level(
-          webrtc::EchoCancellation::kHighSuppression),
-      "EchoCancellation::set_suppression_level");
-  CheckWebRtcResult(apm_->echo_cancellation()->Enable(true),
-                    "EchoCancellation::Enable");
-  CheckWebRtcResult(
-      apm_->noise_suppression()->set_level(webrtc::NoiseSuppression::kHigh),
-      "NoiseSuppression::set_level");
-  CheckWebRtcResult(apm_->noise_suppression()->Enable(true),
-                    "NoiseSuppression::Enable");
-  CheckWebRtcResult(apm_->gain_control()->set_mode(webrtc::GainControl::kFixedDigital),
-                    "GainControl::set_mode");
-  CheckWebRtcResult(apm_->gain_control()->set_target_level_dbfs(3),
-                    "GainControl::set_target_level_dbfs");
-  CheckWebRtcResult(apm_->gain_control()->set_compression_gain_db(9),
-                    "GainControl::set_compression_gain_db");
-  CheckWebRtcResult(apm_->gain_control()->enable_limiter(true),
-                    "GainControl::enable_limiter");
-  CheckWebRtcResult(apm_->gain_control()->Enable(true), "GainControl::Enable");
+  webrtc::ProcessingConfig processing_config;
+  processing_config.input_stream() = webrtc::StreamConfig(kSampleRateHz, 1, false);
+  processing_config.output_stream() = webrtc::StreamConfig(kSampleRateHz, 1, false);
+  processing_config.reverse_input_stream() =
+      webrtc::StreamConfig(kSampleRateHz, 1, false);
+  processing_config.reverse_output_stream() =
+      webrtc::StreamConfig(kSampleRateHz, 1, false);
+  CheckWebRtcResult(apm_->Initialize(processing_config),
+                    "AudioProcessing::Initialize");
 }
 
 WebRtcProcessor::~WebRtcProcessor() = default;
@@ -64,31 +139,28 @@ std::vector<int16_t> WebRtcProcessor::Process10Ms(
     throw std::invalid_argument("reference frame must contain exactly 10 ms");
   }
 
-  webrtc::AudioFrame reverse_frame;
-  reverse_frame.UpdateFrame(frame_id_, timestamp_, reference.data(),
-                            kSamplesPerChannelPerFrame, kSampleRateHz,
-                            webrtc::AudioFrame::kNormalSpeech,
-                            webrtc::AudioFrame::kVadUnknown, kOutputChannels);
-  CheckWebRtcResult(apm_->AnalyzeReverseStream(&reverse_frame),
-                    "AudioProcessing::AnalyzeReverseStream");
+  std::vector<int16_t> reverse_out(reference.size(), 0);
+  const webrtc::StreamConfig stream_config(kSampleRateHz, 1, false);
+  CheckWebRtcResult(
+      apm_->ProcessReverseStream(reference.data(), stream_config, stream_config,
+                                 reverse_out.data()),
+      "AudioProcessing::ProcessReverseStream");
 
-  webrtc::AudioFrame capture_frame;
-  capture_frame.UpdateFrame(frame_id_, timestamp_, mic.data(),
-                            kSamplesPerChannelPerFrame, kSampleRateHz,
-                            webrtc::AudioFrame::kNormalSpeech,
-                            webrtc::AudioFrame::kVadUnknown, kOutputChannels);
+  std::vector<int16_t> adjusted_mic = mic;
+  ProcessPreAecAutoGain(&adjusted_mic, options_.pre_aec_auto_gain,
+                        &pre_aec_gain_state_);
 
-  CheckWebRtcResult(apm_->set_stream_delay_ms(0),
+  CheckWebRtcResult(apm_->set_stream_delay_ms(options_.delay_ms),
                     "AudioProcessing::set_stream_delay_ms");
-  CheckWebRtcResult(apm_->ProcessStream(&capture_frame),
+  std::vector<int16_t> processed(adjusted_mic.size(), 0);
+  CheckWebRtcResult(apm_->ProcessStream(adjusted_mic.data(), stream_config,
+                                        stream_config, processed.data()),
                     "AudioProcessing::ProcessStream");
 
   timestamp_ += static_cast<uint32_t>(kSamplesPerChannelPerFrame);
   ++frame_id_;
 
-  return std::vector<int16_t>(
-      capture_frame.data_,
-      capture_frame.data_ + capture_frame.samples_per_channel_);
+  return processed;
 }
 
 void WebRtcProcessor::CheckWebRtcResult(int result, const char* operation) const {

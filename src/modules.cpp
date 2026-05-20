@@ -93,9 +93,11 @@ void ModuleAFileSource::Run() {
 }
 
 ModuleBWebRtcProcessor::ModuleBWebRtcProcessor(std::string capture_socket,
-                                               std::string processed_socket)
+                                               std::string processed_socket,
+                                               WebRtcProcessorOptions options)
     : capture_socket_(std::move(capture_socket)),
-      processed_socket_(std::move(processed_socket)) {}
+      processed_socket_(std::move(processed_socket)),
+      options_(options) {}
 
 void ModuleBWebRtcProcessor::Run() {
   FileDescriptor output_server = CreateUnixServerSocket(processed_socket_, 1);
@@ -110,7 +112,7 @@ void ModuleBWebRtcProcessor::Run() {
       AcceptUnixClientWithTimeout(output_server.get(), kSocketAcceptTimeout);
   std::cout << "[B] downstream connected; WebRTC AEC/NS/AGC enabled\n";
 
-  WebRtcProcessor processor;
+  WebRtcProcessor processor(options_);
   std::vector<uint8_t> input_frame(kInputBytesPerFrame, 0);
   uint64_t frames_processed = 0;
 

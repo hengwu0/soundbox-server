@@ -1,5 +1,7 @@
 #pragma once
 
+#include "audio_processing_module/webrtc_processor.hpp"
+
 #include <chrono>
 #include <string>
 
@@ -9,6 +11,7 @@ struct PipelineOptions {
   std::string input_file;
   std::string output_file;
   std::string socket_dir;
+  WebRtcProcessorOptions processor;
 };
 
 class ModuleAFileSource {
@@ -23,12 +26,15 @@ class ModuleAFileSource {
 
 class ModuleBWebRtcProcessor {
  public:
-  ModuleBWebRtcProcessor(std::string capture_socket, std::string processed_socket);
+  ModuleBWebRtcProcessor(std::string capture_socket,
+                         std::string processed_socket,
+                         WebRtcProcessorOptions options);
   void Run();
 
  private:
   std::string capture_socket_;
   std::string processed_socket_;
+  WebRtcProcessorOptions options_;
 };
 
 class ModuleCWavSink {
