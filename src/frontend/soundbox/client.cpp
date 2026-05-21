@@ -92,6 +92,11 @@ const char* GuardActionName(CommandGuardAction action) {
   return "unknown";
 }
 
+// 将配置里的毫秒超时转换成 chrono；非法非正数回退到 fallback_ms，避免等待时间变成 0。
+std::chrono::milliseconds ConfiguredTimeout(int configured_ms, int fallback_ms) {
+  return std::chrono::milliseconds(configured_ms > 0 ? configured_ms : fallback_ms);
+}
+
 }  // namespace
 
 // 构造 soundbox 客户端。
@@ -175,13 +180,7 @@ bool SoundBoxClient::PlayPcm(const std::vector<uint8_t>& chunk) {
   if (chunk.empty()) {
     return true;
   }
-  nlohmann::json stream = {
-      {"id", NextId()},
-      {"tag", "play"},
-      {"bytes", chunk},
-  };
-  const auto dumped = stream.dump();
-  return SendBinary(std::vector<uint8_t>(dumped.begin(), dumped.end()));
+  return SendBinary(BuildPlayPcmPacket(NextId(), chunk));
 }
 
 // 重置播放链路。
@@ -238,7 +237,8 @@ bool SoundBoxClient::NotifyLlmStart() {
   }
 
   nlohmann::json response;
-  const bool ok = Call("llm_start", nullptr, std::chrono::milliseconds(kLlmStartTimeoutMs),
+  const bool ok = Call("llm_start", nullptr,
+                       ConfiguredTimeout(cfg_.soundbox.llm_start_timeout_ms, 1000),
                        &response);
   if (ok && response.value("msg", std::string()) == "llm_start_ok") {
     mode_controller_.ForceEnter(AudioMode::LlmWorking, "llm_start_ok");
@@ -267,7 +267,8 @@ bool SoundBoxClient::NotifyLlmStop() {
 
   nlohmann::json response;
   const bool ok =
-      Call("llm_stop", nullptr, std::chrono::milliseconds(kLlmStopTimeoutMs), &response);
+      Call("llm_stop", nullptr,
+           ConfiguredTimeout(cfg_.soundbox.llm_stop_timeout_ms, 1000), &response);
   if (ok && response.value("msg", std::string()) == "llm_stop_ok") {
     mode_controller_.ForceEnter(AudioMode::Kws, "llm_stop_ok");
     return true;

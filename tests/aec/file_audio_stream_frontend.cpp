@@ -30,9 +30,11 @@ uint64_t FileSizeOrThrow(const std::string& path) {
 }  // namespace
 
 FileAudioStreamFrontend::FileAudioStreamFrontend(std::string input_file,
-                                                 std::string aec_socket_path)
+                                                 std::string aec_socket_path,
+                                                 bool realtime)
     : input_file_(std::move(input_file)),
-      aec_socket_path_(std::move(aec_socket_path)) {}
+      aec_socket_path_(std::move(aec_socket_path)),
+      realtime_(realtime) {}
 
 void FileAudioStreamFrontend::Run() {
   const uint64_t input_bytes = FileSizeOrThrow(input_file_);
@@ -70,8 +72,10 @@ void FileAudioStreamFrontend::Run() {
     WriteAll(aec_socket.get(), frame.data(), frame.size());
     ++frames_sent;
 
-    next_frame_time += std::chrono::milliseconds(kFrameDurationMs);
-    std::this_thread::sleep_until(next_frame_time);
+    if (realtime_) {
+      next_frame_time += std::chrono::milliseconds(kFrameDurationMs);
+      std::this_thread::sleep_until(next_frame_time);
+    }
 
     if (static_cast<size_t>(bytes_read) < frame.size()) {
       break;

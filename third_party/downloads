@@ -10,6 +10,8 @@
 # - abseil-cpp 使用 GitHub 发布的源码 tarball。
 # - abseil-cpp-patch 是 Meson wrapdb 为 abseil-cpp 提供的离线 patch 包。
 # - meson 使用 PyPI 发布的 wheel，作为本项目离线构建第三方源码的工具。
+# - ixwebsocket / nlohmann_json / spdlog 是 soundbox frontend 的 WebSocket、JSON 和日志依赖。
+# - sherpa-onnx 及其依赖用于本地 KWS；归档名必须与 sherpa-onnx CMake 期望的文件名保持一致。
 
 [webrtc-audio-processing]
 archive=webrtc-audio-processing_1.3.orig.tar.gz
@@ -30,3 +32,68 @@ url=https://wrapdb.mesonbuild.com/v2/abseil-cpp_20230125.1-4/get_patch
 archive=meson-1.11.1-py3-none-any.whl
 sha256=9b3a023657e393dbc5335b95c561337d49b7a458f5541e47ec44f2cc566e0d80
 url=https://files.pythonhosted.org/packages/5e/cd/f3a881ff5e601d6bbeff63b38ee2362e1167c47d9cde03eddf8d71a4ffb0/meson-1.11.1-py3-none-any.whl
+
+[ixwebsocket]
+archive=ixwebsocket-v11.4.5.tar.gz
+sha256=c5fc225edec32bf7d583e55347ef2c9c4940d005c13ef5e848354a85602f5fd6
+url=https://github.com/machinezone/IXWebSocket/archive/refs/tags/v11.4.5.tar.gz
+
+[nlohmann_json]
+archive=nlohmann_json-v3.11.3.tar.xz
+sha256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+url=https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+
+[spdlog]
+archive=spdlog-v1.15.1.tar.gz
+sha256=25c843860f039a1600f232c6eb9e01e6627f7d030a2ae5e232bdd3c9205d26cc
+url=https://github.com/gabime/spdlog/archive/refs/tags/v1.15.1.tar.gz
+
+[sherpa-onnx]
+archive=sherpa-onnx-v1.12.39.tar.gz
+sha256=1e285953204fb2fc882cf2db03580bad45418a7ed586ebec701a2ed285ff4856
+url=https://github.com/k2-fsa/sherpa-onnx/archive/refs/tags/v1.12.39.tar.gz
+
+[sherpa-onnxruntime]
+archive=onnxruntime-linux-x64-glibc2_17-Release-1.24.4.zip
+sha256=2cacf5084737b30f61a5c8a60efa0408b26f3e8ca6cc0dc312fe4d52d07724f9
+url=https://github.com/csukuangfj/onnxruntime-libs/releases/download/v1.24.4/onnxruntime-linux-x64-glibc2_17-Release-1.24.4.zip
+
+[sherpa-kaldi-native-fbank]
+archive=kaldi-native-fbank-1.22.3.tar.gz
+sha256=9176cc66fc7ce1edf85cf355b06e320c57db6297df74277f575183468893cf61
+url=https://github.com/csukuangfj/kaldi-native-fbank/archive/refs/tags/v1.22.3.tar.gz
+
+[sherpa-kissfft]
+archive=kissfft-febd4caeed32e33ad8b2e0bb5ea77542c40f18ec.zip
+sha256=497103e664168ebe39580b757adbe616f6cf85a16572af581ca7bc42d0ab13fd
+url=https://github.com/mborgerding/kissfft/archive/febd4caeed32e33ad8b2e0bb5ea77542c40f18ec.zip
+
+[sherpa-kaldi-decoder]
+archive=kaldi-decoder-0.3.0.tar.gz
+sha256=b9f34cfb4fd3b1344100eead79ef4d37aa15962274b9e3056de345021f76a1b0
+url=https://github.com/k2-fsa/kaldi-decoder/archive/refs/tags/v0.3.0.tar.gz
+
+[sherpa-kaldifst]
+archive=kaldifst-1.8.0.tar.gz
+sha256=3f247b7e5a2409071202f5e2bc6200060f66728c0a3443c03923ad2723e040b3
+url=https://github.com/k2-fsa/kaldifst/archive/refs/tags/v1.8.0.tar.gz
+
+[sherpa-openfst]
+archive=openfst-1.8.5-2026-04-11.tar.gz
+sha256=57fbc4b950ae81b1a0e1e298af15652da968a6723a592b7874e9b4027a80a5b4
+url=https://github.com/csukuangfj/openfst/archive/refs/tags/v1.8.5-2026-04-11.tar.gz
+
+[sherpa-eigen]
+archive=eigen-5.0.1.tar.gz
+sha256=e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec
+url=https://gitlab.com/libeigen/eigen/-/archive/5.0.1/eigen-5.0.1.tar.gz
+
+[sherpa-simple-sentencepiece]
+archive=simple-sentencepiece-0.7.tar.gz
+sha256=1748a822060a35baa9f6609f84efc8eb54dc0e74b9ece3d82367b7119fdc75af
+url=https://github.com/pkufool/simple-sentencepiece/archive/refs/tags/v0.7.tar.gz
+
+[sherpa-json]
+archive=json-3.12.0.tar.gz
+sha256=4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187
+url=https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz

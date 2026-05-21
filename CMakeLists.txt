@@ -15,11 +15,13 @@ set(THIRD_PARTY_WEBRTC_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/webrtc-audio-pr
 set(THIRD_PARTY_PKGCONFIG_DIR "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/pkgconfig")
 set(THIRD_PARTY_APM_LIB "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/libwebrtc-audio-processing-1.a")
 set(THIRD_PARTY_AC_LIB "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/libwebrtc-audio-coding-1.a")
+set(THIRD_PARTY_ABSL_CRC_LIB "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/libabsl_crc.a")
 set(THIRD_PARTY_APM_PC "${THIRD_PARTY_PKGCONFIG_DIR}/webrtc-audio-processing-1.pc")
 set(THIRD_PARTY_AC_PC "${THIRD_PARTY_PKGCONFIG_DIR}/webrtc-audio-coding-1.pc")
 set(THIRD_PARTY_IXWEBSOCKET_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/ixwebsocket")
 set(THIRD_PARTY_NLOHMANN_JSON_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/nlohmann_json")
 set(THIRD_PARTY_SPDLOG_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/spdlog")
+set(THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/sherpa-onnx-x64-shared")
 set(THIRD_PARTY_CMAKE_BUILD_TYPE "Release")
 
 find_package(PkgConfig REQUIRED)
@@ -48,6 +50,41 @@ target_include_directories(ixwebsocket::ixwebsocket
   INTERFACE
     "${THIRD_PARTY_IXWEBSOCKET_INSTALL_ROOT}/include"
 )
+
+find_path(SHERPA_ONNX_INCLUDE_DIR
+  NAMES sherpa-onnx/c-api/cxx-api.h
+  HINTS "${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}"
+  PATH_SUFFIXES include
+  NO_DEFAULT_PATH
+)
+
+find_library(SHERPA_ONNX_CXX_API_SHARED
+  NAMES sherpa-onnx-cxx-api
+  HINTS "${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}"
+  PATH_SUFFIXES lib
+  NO_DEFAULT_PATH
+)
+
+find_library(SHERPA_ONNX_C_API_SHARED
+  NAMES sherpa-onnx-c-api
+  HINTS "${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}"
+  PATH_SUFFIXES lib
+  NO_DEFAULT_PATH
+)
+
+find_library(ONNXRUNTIME_SHARED
+  NAMES onnxruntime
+  HINTS "${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}"
+  PATH_SUFFIXES lib
+  NO_DEFAULT_PATH
+)
+
+if(NOT SHERPA_ONNX_INCLUDE_DIR OR NOT SHERPA_ONNX_CXX_API_SHARED OR
+   NOT SHERPA_ONNX_C_API_SHARED OR NOT ONNXRUNTIME_SHARED)
+  message(FATAL_ERROR "vendored sherpa-onnx runtime was not prepared correctly")
+endif()
+
+get_filename_component(SHERPA_ONNX_LIBRARY_DIR "${SHERPA_ONNX_CXX_API_SHARED}" DIRECTORY)
 
 if(DEFINED ENV{PKG_CONFIG_PATH} AND NOT "$ENV{PKG_CONFIG_PATH}" STREQUAL "")
   set(ENV{PKG_CONFIG_PATH}
@@ -143,6 +180,7 @@ add_library(kws_module
   src/apm/kws/gate.cpp
   src/apm/kws/keywords.cpp
   src/apm/kws/kws_socket_server.cpp
+  src/apm/kws/kws_zipformer.cpp
   src/apm/kws/local_listener.cpp
   src/apm/kws/trigger.cpp
 )
@@ -150,12 +188,16 @@ add_library(kws_module
 target_include_directories(kws_module
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+    ${SHERPA_ONNX_INCLUDE_DIR}
 )
 
 target_link_libraries(kws_module
   PUBLIC
     common_module
     nlohmann_json::nlohmann_json
+    ${SHERPA_ONNX_CXX_API_SHARED}
+    ${SHERPA_ONNX_C_API_SHARED}
+    ${ONNXRUNTIME_SHARED}
 )
 
 target_compile_options(kws_module
@@ -197,6 +239,7 @@ target_link_libraries(aec_module
   PUBLIC
     common_module
     PkgConfig::WEBRTC_APM
+    "${THIRD_PARTY_ABSL_CRC_LIB}"
 )
 
 add_dependencies(aec_module ensure_third_party)
@@ -252,6 +295,10 @@ target_link_libraries(soundbox-server
     audio_processing_module
 )
 
+set_target_properties(soundbox-server PROPERTIES
+  BUILD_RPATH "${SHERPA_ONNX_LIBRARY_DIR}"
+)
+
 add_dependencies(soundbox-server ensure_third_party)
 
 enable_testing()
@@ -269,6 +316,9 @@ target_link_libraries(audio_processing_module_tests
 add_dependencies(audio_processing_module_tests ensure_third_party)
 
 add_test(NAME audio_processing_module_tests COMMAND audio_processing_module_tests)
+set_tests_properties(audio_processing_module_tests PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
 
 add_custom_target(distclean
   COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}" --target clean

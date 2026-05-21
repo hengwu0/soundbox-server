@@ -102,7 +102,9 @@ struct ZipformerKwsEngine::Impl {
       auto r = spotter.GetResult(&stream);
       if (!r.keyword.empty()) {
         spotter.Reset(&stream);
-        return KwsHit{.keyword = r.keyword};
+        KwsHit hit;
+        hit.keyword = r.keyword;
+        return hit;
       }
     }
 

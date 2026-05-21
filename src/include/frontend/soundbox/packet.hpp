@@ -52,4 +52,9 @@ struct Packet {
 // - 返回 response/event/record/unknown。
 const char* PacketTypeName(PacketType type);
 
+// BuildPlayPcmPacket 把 playback PCM 打包成 open-xiaoai-client 约定的 tag=play
+// 二进制载荷；调用方负责把返回字节作为 WebSocket binary frame 发送。
+std::vector<uint8_t> BuildPlayPcmPacket(const std::string& id,
+                                        const std::vector<uint8_t>& chunk);
+
 }  // namespace xiaoai_server::soundbox

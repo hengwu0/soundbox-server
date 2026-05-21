@@ -6,13 +6,32 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <sys/types.h>
 #include <thread>
 #include <vector>
 
 namespace soundbox_server::frontend {
+
+enum class ControlMessageType {
+  kSessionStart,
+  kSessionEnd,
+};
+
+struct ControlMessage {
+  ControlMessageType type;
+  std::string reason;
+  std::optional<double> score;
+  std::optional<int64_t> timestamp_ms;
+};
+
+ControlMessage ParseControlMessageLine(const std::string& line,
+                                       ControlMessageType expected_type);
 
 class Frontend {
  public:
@@ -30,6 +49,7 @@ class Frontend {
     std::string playback_socket_path;
     xiaoai_server::config::Config soundbox_config;
     size_t playback_read_chunk_bytes{4096};
+    std::function<ssize_t(int, uint8_t*, size_t)> playback_read;
   };
 
   explicit Frontend(Options options);
@@ -47,8 +67,9 @@ class Frontend {
   void AecControlReaderLoop();
   void PlaybackAcceptLoop();
   void PlaybackClientLoop(int client_fd);
-  void HandleSessionStart();
-  void HandleSessionEnd();
+  void HandleSessionStart(const ControlMessage& message);
+  void HandleSessionEnd(const ControlMessage& message);
+  void EnterFaultAndStop(const char* reason);
   void SetState(State state, const char* reason);
   bool IsStopping() const;
 

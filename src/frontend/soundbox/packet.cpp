@@ -22,4 +22,15 @@ const char* PacketTypeName(PacketType type) {
   return "unknown";
 }
 
+std::vector<uint8_t> BuildPlayPcmPacket(const std::string& id,
+                                        const std::vector<uint8_t>& chunk) {
+  nlohmann::json stream = {
+      {"id", id},
+      {"tag", "play"},
+      {"bytes", chunk},
+  };
+  const auto dumped = stream.dump();
+  return std::vector<uint8_t>(dumped.begin(), dumped.end());
+}
+
 }  // namespace xiaoai_server::soundbox

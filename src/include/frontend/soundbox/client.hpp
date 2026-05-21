@@ -73,9 +73,7 @@ class SoundBoxClient {
   AudioMode CurrentMode() const;
 
  private:
-  // 固定超时参数。
-  static constexpr int kLlmStartTimeoutMs = 1000;
-  static constexpr int kLlmStopTimeoutMs = 1000;
+  // 固定远端播放/录音命令超时；llm_start/llm_stop 使用配置里的独立超时。
   static constexpr int kAudioCommandTimeoutMs = 3000;
   static constexpr size_t kAudioPipeMaxPackets = 100;
   static constexpr size_t kAudioPipeMaxBytes = 10 * 1024 * 1024;

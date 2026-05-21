@@ -2,7 +2,9 @@
 
 #include "apm/aec/aec_stream_processor.hpp"
 #include "apm/kws/kws_socket_server.hpp"
+#include "apm/kws/kws_zipformer.hpp"
 #include "apm/aec/webrtc_processor.hpp"
+#include "common/log.hpp"
 #include "frontend/soundbox_frontend.hpp"
 #include "llm/file_recorder.hpp"
 
@@ -10,14 +12,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -27,24 +31,42 @@
 namespace audio_processing_module {
 namespace {
 
-class PassiveKwsEngine final : public xiaoai_server::wakeup::IKwsEngine {
- public:
-  std::optional<xiaoai_server::wakeup::KwsHit> AcceptPcm16(
-      const uint8_t* /*pcm*/,
-      size_t /*size_bytes*/,
-      int /*sample_rate*/,
-      int /*channels*/,
-      int /*bits_per_sample*/) override {
-    return std::nullopt;
-  }
-
-  void Reset() override {}
-};
-
 struct CliOptions {
   std::string input_file;
   std::string output_file;
   std::string config_path;
+};
+
+volatile std::sig_atomic_t g_shutdown_signal = 0;
+
+void HandleShutdownSignal(int signal_number) {
+  g_shutdown_signal = signal_number;
+}
+
+bool ShutdownSignalRequested() {
+  return g_shutdown_signal != 0;
+}
+
+class SignalHandlerGuard {
+ public:
+  SignalHandlerGuard()
+      : previous_sigint_(std::signal(SIGINT, HandleShutdownSignal)),
+        previous_sigterm_(std::signal(SIGTERM, HandleShutdownSignal)) {
+    g_shutdown_signal = 0;
+  }
+
+  ~SignalHandlerGuard() {
+    std::signal(SIGINT, previous_sigint_);
+    std::signal(SIGTERM, previous_sigterm_);
+  }
+
+  SignalHandlerGuard(const SignalHandlerGuard&) = delete;
+  SignalHandlerGuard& operator=(const SignalHandlerGuard&) = delete;
+
+ private:
+  using Handler = void (*)(int);
+  Handler previous_sigint_{SIG_DFL};
+  Handler previous_sigterm_{SIG_DFL};
 };
 
 std::string RequireValue(const std::vector<std::string>& args, size_t& index) {
@@ -296,15 +318,18 @@ void ApplyConfigEntry(PipelineOptions* options,
 
   if (key == "socket_dir") {
     options->socket_dir = value;
+  } else if (key == "output_file") {
+    options->output_file = value;
   } else if (key == "soundbox.ws_url") {
     options->runtime.soundbox.ws_url = value;
   } else if (key == "soundbox.ws_token") {
     options->runtime.soundbox.ws_token = value;
   } else if (key == "soundbox.connect_timeout_ms") {
     options->runtime.soundbox.connect_timeout_ms = ParseInt(value, key);
-  } else if (key == "soundbox.llm_start_timeout_ms" ||
-             key == "soundbox.llm_stop_timeout_ms") {
-    (void)ParseInt(value, key);
+  } else if (key == "soundbox.llm_start_timeout_ms") {
+    options->runtime.soundbox.llm_start_timeout_ms = ParseInt(value, key);
+  } else if (key == "soundbox.llm_stop_timeout_ms") {
+    options->runtime.soundbox.llm_stop_timeout_ms = ParseInt(value, key);
   } else if (key == "wakeup.say_hello") {
     options->runtime.wakeup.say_hello = value;
   } else if (key == "wakeup.keywords_file") {
@@ -333,6 +358,8 @@ void ApplyConfigEntry(PipelineOptions* options,
     options->runtime.xiaozhi.downlink_sample_rate = ParseInt(value, key);
   } else if (key == "playback.channels" || key == "playback.bits_per_sample") {
     (void)ParseInt(value, key);
+  } else if (key == "audio.playback_gain") {
+    options->runtime.audio.playback_gain = ParseFloat(value, key);
   } else if (key == "delay_ms" || key == "aec.delay_ms") {
     processor.delay_ms = ParseInt(value, key);
   } else if (key == "pre_aec_auto_gain.enabled" ||
@@ -454,6 +481,8 @@ PipelineOptions DefaultPipelineOptions() {
   PipelineOptions options;
   options.output_file = "output/aec_processed.wav";
   options.socket_dir = DefaultSocketDir();
+  options.runtime.soundbox.ws_url.clear();
+  options.runtime.soundbox.ws_token.clear();
   options.runtime.log.file_path = "logs/soundbox_server.log";
   return options;
 }
@@ -479,14 +508,6 @@ CliOptions ParseCliOptions(const std::vector<std::string>& args) {
   }
 
   return options;
-}
-
-void RethrowFirstError(const std::vector<std::exception_ptr>& errors) {
-  for (const auto& error : errors) {
-    if (error) {
-      std::rethrow_exception(error);
-    }
-  }
 }
 
 }  // namespace
@@ -520,7 +541,98 @@ std::string Usage(const std::string& program_name) {
   return output.str();
 }
 
+void RunSupervisedWorkers(const std::vector<SupervisedWorker>& workers,
+                          const std::function<bool()>& should_stop) {
+  if (workers.empty()) {
+    return;
+  }
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::exception_ptr first_error;
+  std::atomic<bool> stop_requested{false};
+  size_t completed = 0;
+
+  auto record_error = [&](std::exception_ptr error) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!first_error) {
+        first_error = error;
+      }
+    }
+    stop_requested.store(true);
+    cv.notify_all();
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(workers.size());
+  for (size_t index = 0; index < workers.size(); ++index) {
+    threads.emplace_back([&, index] {
+      try {
+        workers[index].run();
+        if (!stop_requested.load()) {
+          record_error(std::make_exception_ptr(
+              std::runtime_error("worker exited unexpectedly: " +
+                                 workers[index].name)));
+        }
+      } catch (...) {
+        record_error(std::current_exception());
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++completed;
+      }
+      cv.notify_all();
+    });
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait_for(lock, std::chrono::milliseconds(200), [&] {
+      return first_error || completed == workers.size() ||
+             (should_stop && should_stop());
+    });
+    while (!first_error && completed != workers.size() &&
+           !(should_stop && should_stop())) {
+      cv.wait_for(lock, std::chrono::milliseconds(200));
+    }
+    if (first_error || (should_stop && should_stop())) {
+      stop_requested.store(true);
+    }
+  }
+
+  if (stop_requested.load()) {
+    for (auto it = workers.rbegin(); it != workers.rend(); ++it) {
+      if (it->stop) {
+        try {
+          it->stop();
+        } catch (...) {
+        }
+      }
+    }
+  }
+
+  for (std::thread& thread : threads) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+
+  if (first_error) {
+    std::rethrow_exception(first_error);
+  }
+}
+
 int RunPipeline(const PipelineOptions& options) {
+  const bool file_log_ready = xiaoai_server::ConfigureLogging(
+      options.runtime.log.enable_debug, options.runtime.log.file_enabled,
+      options.runtime.log.file_path);
+  const auto log = xiaoai_server::GetLogger("main");
+  log->info("logging configured debug={} file_enabled={} file_ready={} file_path={}",
+            options.runtime.log.enable_debug, options.runtime.log.file_enabled,
+            file_log_ready, options.runtime.log.file_path);
+
   if (options.runtime.soundbox.ws_url.empty()) {
     throw std::runtime_error("missing required config: soundbox.ws_url");
   }
@@ -553,7 +665,9 @@ int RunPipeline(const PipelineOptions& options) {
   llm::FileRecorder llm(aec_llm_socket, options.output_file);
   apm::aec::AecStreamProcessor aec(frontend_aec_socket, aec_llm_socket,
                                    options.processor);
-  auto kws_engine = std::make_shared<PassiveKwsEngine>();
+  auto kws_engine =
+      std::make_shared<xiaoai_server::wakeup::ZipformerKwsEngine>(
+          options.runtime.wakeup);
   apm::kws::KwsSocketServer::Options kws_options;
   kws_options.listen_socket_path = frontend_kws_socket;
   apm::kws::KwsSocketServer kws(kws_options, kws_engine);
@@ -565,34 +679,17 @@ int RunPipeline(const PipelineOptions& options) {
   frontend_options.soundbox_config = options.runtime;
   soundbox_server::frontend::Frontend frontend(frontend_options);
 
-  std::vector<std::exception_ptr> errors(4);
-  std::mutex error_mutex;
-
-  auto run_thread = [&](size_t index, auto&& task) {
-    try {
-      task();
-    } catch (...) {
-      std::lock_guard<std::mutex> lock(error_mutex);
-      errors[index] = std::current_exception();
-    }
-  };
-
-  std::thread llm_thread([&] { run_thread(0, [&] { llm.Run(); }); });
-  std::thread aec_thread([&] { run_thread(1, [&] { aec.Run(); }); });
-  std::thread kws_thread([&] { run_thread(2, [&] { kws.Run(); }); });
-  std::thread frontend_thread([&] { run_thread(3, [&] { frontend.Run(); }); });
-
-  frontend_thread.join();
-  frontend.Stop();
-  kws.Stop();
-  if (kws_thread.joinable()) {
-    kws_thread.join();
-  }
-  aec_thread.join();
-  llm_thread.join();
-
-  RethrowFirstError(errors);
-  std::cout << "[main] pipeline completed successfully\n";
+  SignalHandlerGuard signal_handler_guard;
+  RunSupervisedWorkers(
+      {
+          SupervisedWorker{"llm", [&] { llm.Run(); }, [&] { llm.Stop(); }},
+          SupervisedWorker{"aec", [&] { aec.Run(); }, [&] { aec.Stop(); }},
+          SupervisedWorker{"kws", [&] { kws.Run(); }, [&] { kws.Stop(); }},
+          SupervisedWorker{"frontend", [&] { frontend.Run(); },
+                           [&] { frontend.Stop(); }},
+      },
+      [] { return ShutdownSignalRequested(); });
+  log->info("pipeline completed successfully");
   return 0;
 }
 

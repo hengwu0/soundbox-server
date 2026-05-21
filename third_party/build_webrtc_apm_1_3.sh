@@ -40,6 +40,7 @@ build_dir="${build_root}/webrtc-audio-processing-${version}-${default_library}"
 prefix="${install_root}/webrtc-audio-processing-${version}"
 processing_lib="${prefix}/lib/libwebrtc-audio-processing-1.a"
 coding_lib="${prefix}/lib/libwebrtc-audio-coding-1.a"
+absl_crc_lib="${prefix}/lib/libabsl_crc.a"
 processing_pc="${prefix}/lib/pkgconfig/webrtc-audio-processing-1.pc"
 coding_pc="${prefix}/lib/pkgconfig/webrtc-audio-coding-1.pc"
 
@@ -139,7 +140,13 @@ load_download_entry "${abseil_section}" abseil_archive abseil_sha256 abseil_url
 load_download_entry "${abseil_patch_section}" abseil_patch abseil_patch_sha256 abseil_patch_url
 load_download_entry "${meson_section}" meson_wheel meson_sha256 meson_url
 
-if [[ -f "${processing_lib}" && -f "${coding_lib}" &&
+absl_crc_archive_header=""
+if [[ -f "${absl_crc_lib}" ]]; then
+  absl_crc_archive_header="$(head -c 8 "${absl_crc_lib}")"
+fi
+
+if [[ -f "${processing_lib}" && -f "${coding_lib}" && -f "${absl_crc_lib}" &&
+      "${absl_crc_archive_header}" == $'!<arch>\n' &&
       -f "${processing_pc}" && -f "${coding_pc}" ]]; then
   echo "WebRTC APM ${version} already installed at: ${prefix}"
   exit 0
@@ -166,6 +173,18 @@ fi
 
 python3 -m mesonbuild.mesonmain compile -C "${build_dir}" -j "${build_jobs}"
 python3 -m mesonbuild.mesonmain install -C "${build_dir}"
+
+build_absl_crc_objects_dir="${build_dir}/subprojects/abseil-cpp-20230125.1/libabsl_crc.a.p"
+if [[ ! -d "${build_absl_crc_objects_dir}" ]]; then
+  echo "Missing built Abseil CRC object directory: ${build_absl_crc_objects_dir}" >&2
+  exit 1
+fi
+rm -f "${absl_crc_lib}"
+(
+  cd "${build_dir}"
+  ar crs "${absl_crc_lib}" \
+    subprojects/abseil-cpp-20230125.1/libabsl_crc.a.p/*.o
+)
 
 cat <<EOF
 WebRTC APM ${version} installed at: ${prefix}

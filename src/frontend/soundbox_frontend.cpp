@@ -1,13 +1,17 @@
 #include "frontend/soundbox_frontend.hpp"
 
+#include "common/log.hpp"
+
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <iostream>
 #include <stdexcept>
 #include <thread>
+
+#include <nlohmann/json.hpp>
 
 namespace soundbox_server::frontend {
 namespace {
@@ -16,9 +20,61 @@ constexpr auto kSocketConnectTimeout = std::chrono::seconds(10);
 constexpr auto kSocketRetryInterval = std::chrono::milliseconds(20);
 constexpr auto kAcceptPollTimeout = std::chrono::milliseconds(200);
 
-bool ContainsType(const std::string& line, const char* type) {
-  return line.find("\"type\"") != std::string::npos &&
-         line.find(type) != std::string::npos;
+const auto kLog = xiaoai_server::GetLogger("frontend");
+
+const char* ControlMessageTypeName(ControlMessageType type) {
+  switch (type) {
+    case ControlMessageType::kSessionStart:
+      return "session_start";
+    case ControlMessageType::kSessionEnd:
+      return "session_end";
+  }
+  return "unknown";
+}
+
+int64_t GetIntegerField(const nlohmann::json& message, const char* field) {
+  const auto it = message.find(field);
+  if (it == message.end()) {
+    throw std::runtime_error(std::string("control message missing field: ") + field);
+  }
+  if (!it->is_number_integer() && !it->is_number_unsigned()) {
+    throw std::runtime_error(std::string("control message field must be integer: ") +
+                             field);
+  }
+  return it->get<int64_t>();
+}
+
+std::optional<int64_t> GetOptionalIntegerField(const nlohmann::json& message,
+                                               const char* field) {
+  if (!message.contains(field)) {
+    return std::nullopt;
+  }
+  return GetIntegerField(message, field);
+}
+
+std::string GetStringField(const nlohmann::json& message, const char* field) {
+  const auto it = message.find(field);
+  if (it == message.end()) {
+    throw std::runtime_error(std::string("control message missing field: ") + field);
+  }
+  if (!it->is_string()) {
+    throw std::runtime_error(std::string("control message field must be string: ") +
+                             field);
+  }
+  return it->get<std::string>();
+}
+
+std::optional<double> GetOptionalNumberField(const nlohmann::json& message,
+                                             const char* field) {
+  const auto it = message.find(field);
+  if (it == message.end()) {
+    return std::nullopt;
+  }
+  if (!it->is_number()) {
+    throw std::runtime_error(std::string("control message field must be numeric: ") +
+                             field);
+  }
+  return it->get<double>();
 }
 
 std::string ReadJsonLine(int fd) {
@@ -43,6 +99,12 @@ std::string ReadJsonLine(int fd) {
   }
 }
 
+void ShutdownSocket(int fd) {
+  if (fd >= 0) {
+    ::shutdown(fd, SHUT_RDWR);
+  }
+}
+
 }  // namespace
 
 const char* StateName(Frontend::State state) {
@@ -59,6 +121,42 @@ const char* StateName(Frontend::State state) {
       return "Fault";
   }
   return "Unknown";
+}
+
+ControlMessage ParseControlMessageLine(const std::string& line,
+                                       ControlMessageType expected_type) {
+  const auto message = nlohmann::json::parse(line, nullptr, false);
+  if (message.is_discarded() || !message.is_object()) {
+    throw std::runtime_error("control message line is not a JSON object");
+  }
+
+  const std::string type = GetStringField(message, "type");
+  const std::string expected_type_name = ControlMessageTypeName(expected_type);
+  if (type != expected_type_name) {
+    throw std::runtime_error("unexpected control message type: " + type +
+                             ", expected: " + expected_type_name);
+  }
+
+  ControlMessage parsed;
+  parsed.type = expected_type;
+  parsed.timestamp_ms = GetOptionalIntegerField(message, "timestamp_ms");
+
+  if (expected_type == ControlMessageType::kSessionStart) {
+    parsed.reason = GetStringField(message, "reason");
+    if (parsed.reason != "kws_hit") {
+      throw std::runtime_error("session_start reason must be kws_hit");
+    }
+    parsed.score = GetOptionalNumberField(message, "score");
+    return parsed;
+  }
+
+  if (message.contains("reason")) {
+    parsed.reason = GetStringField(message, "reason");
+  }
+  if (message.contains("score")) {
+    parsed.score = GetOptionalNumberField(message, "score");
+  }
+  return parsed;
 }
 
 Frontend::Frontend(Options options) : options_(std::move(options)) {
@@ -94,9 +192,8 @@ void Frontend::Run() {
     OnAecAudio(chunk);
   };
   callbacks.on_connection_closed = [this](const std::string& reason) {
-    std::cout << "[frontend] soundbox connection closed: " << reason << '\n';
-    SetState(State::kFault, "soundbox_connection_closed");
-    Stop();
+    kLog->warn("soundbox connection closed reason={}", reason);
+    EnterFaultAndStop("soundbox_connection_closed");
   };
   client_ = std::make_unique<xiaoai_server::soundbox::SoundBoxClient>(
       options_.soundbox_config, std::move(callbacks));
@@ -121,11 +218,13 @@ void Frontend::Stop() {
   if (client_) {
     client_->Stop();
   }
+  ShutdownSocket(kws_socket_.get());
+  ShutdownSocket(aec_socket_.get());
   kws_socket_.reset();
   aec_socket_.reset();
 
   if (!was_stopped) {
-    std::cout << "[frontend] stop requested\n";
+    kLog->info("stop requested");
   }
   const std::thread::id current_thread = std::this_thread::get_id();
   if (kws_control_thread_.joinable() &&
@@ -143,8 +242,7 @@ void Frontend::Stop() {
 
 void Frontend::OnWakeupAudio(const std::vector<uint8_t>& chunk) {
   if (state() != State::kKws) {
-    std::cout << "[frontend] drop KWS audio while state=" << StateName(state())
-              << '\n';
+    kLog->debug("drop KWS audio while state={}", StateName(state()));
     return;
   }
   audio_processing_module::WriteAll(kws_socket_.get(), chunk.data(), chunk.size());
@@ -152,8 +250,7 @@ void Frontend::OnWakeupAudio(const std::vector<uint8_t>& chunk) {
 
 void Frontend::OnAecAudio(const std::vector<uint8_t>& chunk) {
   if (state() != State::kAec) {
-    std::cout << "[frontend] drop AEC audio while state=" << StateName(state())
-              << '\n';
+    kLog->debug("drop AEC audio while state={}", StateName(state()));
     return;
   }
   audio_processing_module::WriteAll(aec_socket_.get(), chunk.data(), chunk.size());
@@ -164,18 +261,17 @@ void Frontend::KwsControlReaderLoop() {
     while (!IsStopping()) {
       const std::string line = ReadJsonLine(kws_socket_.get());
       if (line.empty()) {
-        break;
+        throw std::runtime_error("KWS control socket disconnected");
       }
-      if (ContainsType(line, "session_start")) {
-        HandleSessionStart();
-      }
+      const ControlMessage message =
+          ParseControlMessageLine(line, ControlMessageType::kSessionStart);
+      HandleSessionStart(message);
     }
   } catch (const std::exception& error) {
     if (!IsStopping()) {
-      std::cout << "[frontend] KWS control reader failed: " << error.what()
-                << '\n';
+      kLog->error("KWS control reader failed: {}", error.what());
       SetState(State::kFault, "kws_control_reader_failed");
-      Stop();
+      EnterFaultAndStop("kws_control_reader_failed");
     }
   }
 }
@@ -185,18 +281,17 @@ void Frontend::AecControlReaderLoop() {
     while (!IsStopping()) {
       const std::string line = ReadJsonLine(aec_socket_.get());
       if (line.empty()) {
-        break;
+        throw std::runtime_error("AEC control socket disconnected");
       }
-      if (ContainsType(line, "session_end")) {
-        HandleSessionEnd();
-      }
+      const ControlMessage message =
+          ParseControlMessageLine(line, ControlMessageType::kSessionEnd);
+      HandleSessionEnd(message);
     }
   } catch (const std::exception& error) {
     if (!IsStopping()) {
-      std::cout << "[frontend] AEC control reader failed: " << error.what()
-                << '\n';
+      kLog->error("AEC control reader failed: {}", error.what());
       SetState(State::kFault, "aec_control_reader_failed");
-      Stop();
+      EnterFaultAndStop("aec_control_reader_failed");
     }
   }
 }
@@ -205,8 +300,7 @@ void Frontend::PlaybackAcceptLoop() {
   audio_processing_module::FileDescriptor server =
       audio_processing_module::CreateUnixServerSocket(options_.playback_socket_path, 1);
   audio_processing_module::SocketPathGuard guard(options_.playback_socket_path);
-  std::cout << "[frontend] playback listen ready: "
-            << options_.playback_socket_path << '\n';
+  kLog->info("playback listen ready socket={}", options_.playback_socket_path);
 
   while (!IsStopping()) {
     try {
@@ -214,7 +308,15 @@ void Frontend::PlaybackAcceptLoop() {
       audio_processing_module::FileDescriptor client =
           audio_processing_module::AcceptUnixClientWithTimeout(server.get(),
                                                                kAcceptPollTimeout);
-      PlaybackClientLoop(client.get());
+      try {
+        PlaybackClientLoop(client.get());
+      } catch (const std::runtime_error& error) {
+        if (IsStopping()) {
+          break;
+        }
+        kLog->warn("playback client failed: {}; waiting for next client",
+                   error.what());
+      }
     } catch (const std::runtime_error& error) {
       if (IsStopping()) {
         break;
@@ -231,7 +333,10 @@ void Frontend::PlaybackAcceptLoop() {
 void Frontend::PlaybackClientLoop(int client_fd) {
   std::vector<uint8_t> buffer(options_.playback_read_chunk_bytes);
   while (!IsStopping()) {
-    const ssize_t bytes_read = ::read(client_fd, buffer.data(), buffer.size());
+    const ssize_t bytes_read = options_.playback_read
+                                   ? options_.playback_read(client_fd, buffer.data(),
+                                                            buffer.size())
+                                   : ::read(client_fd, buffer.data(), buffer.size());
     if (bytes_read < 0) {
       if (errno == EINTR) {
         continue;
@@ -244,19 +349,18 @@ void Frontend::PlaybackClientLoop(int client_fd) {
     }
     std::vector<uint8_t> chunk(buffer.begin(), buffer.begin() + bytes_read);
     if (client_ && !client_->PlayPcm(chunk)) {
-      std::cout << "[frontend] PlayPcm failed for playback chunk bytes="
-                << bytes_read << '\n';
+      kLog->warn("PlayPcm failed playback_chunk_bytes={}", bytes_read);
     }
   }
 }
 
-void Frontend::HandleSessionStart() {
+void Frontend::HandleSessionStart(const ControlMessage& message) {
   if (state() != State::kKws) {
-    std::cout << "[frontend] ignore duplicate session_start while state="
-              << StateName(state()) << '\n';
+    kLog->warn("ignore duplicate session_start while state={}", StateName(state()));
     return;
   }
-  SetState(State::kLlmStarting, "session_start");
+  SetState(State::kLlmStarting,
+           message.reason.empty() ? "session_start" : message.reason.c_str());
   if (client_ && client_->NotifyLlmStart()) {
     SetState(State::kAec, "llm_start_ok");
     return;
@@ -264,19 +368,35 @@ void Frontend::HandleSessionStart() {
   SetState(State::kKws, "llm_start_failed");
 }
 
-void Frontend::HandleSessionEnd() {
+void Frontend::HandleSessionEnd(const ControlMessage& message) {
   if (state() != State::kAec) {
-    std::cout << "[frontend] ignore duplicate session_end while state="
-              << StateName(state()) << '\n';
+    kLog->warn("ignore duplicate session_end while state={}", StateName(state()));
     return;
   }
-  SetState(State::kLlmStopping, "session_end");
+  SetState(State::kLlmStopping,
+           message.reason.empty() ? "session_end" : message.reason.c_str());
   if (client_ && client_->NotifyLlmStop()) {
     SetState(State::kKws, "llm_stop_ok");
     return;
   }
   SetState(State::kFault, "llm_stop_failed");
-  Stop();
+  EnterFaultAndStop("llm_stop_failed");
+}
+
+void Frontend::EnterFaultAndStop(const char* reason) {
+  SetState(State::kFault, reason);
+  const bool was_stopped = stop_requested_.exchange(true);
+  stop_cv_.notify_all();
+  ShutdownSocket(kws_socket_.get());
+  ShutdownSocket(aec_socket_.get());
+  kws_socket_.reset();
+  aec_socket_.reset();
+  if (client_) {
+    client_->Stop();
+  }
+  if (!was_stopped) {
+    kLog->info("stop requested");
+  }
 }
 
 void Frontend::SetState(State next, const char* reason) {
@@ -284,8 +404,8 @@ void Frontend::SetState(State next, const char* reason) {
   if (state_ == next) {
     return;
   }
-  std::cout << "[frontend] state " << StateName(state_) << " -> "
-            << StateName(next) << " reason=" << reason << '\n';
+  kLog->info("state change from={} to={} reason={}",
+             StateName(state_), StateName(next), reason);
   state_ = next;
 }
 

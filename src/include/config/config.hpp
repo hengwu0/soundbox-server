@@ -30,6 +30,10 @@ struct SoundBoxPreset {
   std::string ws_token{"whsn1oeo"};
   // connect_timeout_ms 是连接小爱音箱 WebSocket 的最长等待时间。
   int connect_timeout_ms{10000};
+  // llm_start_timeout_ms 是发送 llm_start 后等待 llm_start_ok 的最长时间。
+  int llm_start_timeout_ms{1000};
+  // llm_stop_timeout_ms 是发送 llm_stop 后等待 llm_stop_ok 的最长时间。
+  int llm_stop_timeout_ms{1000};
 };
 
 // 描述 xiaozhi 上游服务连接与音频协商参数。

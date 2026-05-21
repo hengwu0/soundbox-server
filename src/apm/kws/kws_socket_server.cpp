@@ -1,5 +1,6 @@
 #include "apm/kws/kws_socket_server.hpp"
 
+#include "common/log.hpp"
 #include "common/unix_socket.hpp"
 
 #include <unistd.h>
@@ -7,7 +8,6 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -15,6 +15,8 @@ namespace audio_processing_module::apm::kws {
 namespace {
 
 constexpr auto kAcceptPollTimeout = std::chrono::milliseconds(200);
+
+const auto kLog = xiaoai_server::GetLogger("apm/kws");
 
 std::runtime_error ErrnoError(const std::string& action) {
   return std::runtime_error(action + ": " + std::strerror(errno));
@@ -55,8 +57,7 @@ KwsSocketServer::KwsSocketServer(
 void KwsSocketServer::Run() {
   FileDescriptor server = CreateUnixServerSocket(options_.listen_socket_path, 1);
   SocketPathGuard guard(options_.listen_socket_path);
-  std::cout << "[apm/kws] frontend listen ready: "
-            << options_.listen_socket_path << '\n';
+  kLog->info("frontend listen ready socket={}", options_.listen_socket_path);
 
   while (!stop_requested_.load()) {
     try {
@@ -90,7 +91,7 @@ void KwsSocketServer::Stop() {
 }
 
 void KwsSocketServer::HandleClient(int client_fd) {
-  std::cout << "[apm/kws] frontend connected; KWS PCM stream enabled\n";
+  kLog->info("frontend connected; KWS PCM stream enabled");
   engine_->Reset();
 
   std::vector<uint8_t> buffer(options_.read_chunk_bytes);
@@ -118,7 +119,7 @@ void KwsSocketServer::HandleClient(int client_fd) {
     }
   }
 
-  std::cout << "[apm/kws] frontend disconnected\n";
+  kLog->info("frontend disconnected");
 }
 
 }  // namespace audio_processing_module::apm::kws

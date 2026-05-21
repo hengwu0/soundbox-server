@@ -25,11 +25,65 @@ set(THIRD_PARTY_WEBRTC_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/webrtc-audio-pr
 set(THIRD_PARTY_IXWEBSOCKET_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/ixwebsocket")
 set(THIRD_PARTY_NLOHMANN_JSON_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/nlohmann_json")
 set(THIRD_PARTY_SPDLOG_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/spdlog")
+set(THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT "${THIRD_PARTY_INSTALL_ROOT}/sherpa-onnx-x64-shared")
 
 set(THIRD_PARTY_APM_LIB "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/libwebrtc-audio-processing-1.a")
 set(THIRD_PARTY_AC_LIB "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/libwebrtc-audio-coding-1.a")
+set(THIRD_PARTY_ABSL_CRC_LIB "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/libabsl_crc.a")
 set(THIRD_PARTY_APM_PC "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/pkgconfig/webrtc-audio-processing-1.pc")
 set(THIRD_PARTY_AC_PC "${THIRD_PARTY_WEBRTC_INSTALL_ROOT}/lib/pkgconfig/webrtc-audio-coding-1.pc")
+set(THIRD_PARTY_SHERPA_ONNX_CXX_API "${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}/lib/libsherpa-onnx-cxx-api.so")
+set(THIRD_PARTY_SHERPA_ONNX_C_API "${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}/lib/libsherpa-onnx-c-api.so")
+set(THIRD_PARTY_ONNXRUNTIME_LIB "${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}/lib/libonnxruntime.so")
+set(THIRD_PARTY_SHERPA_ONNX_HEADER "${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}/include/sherpa-onnx/c-api/cxx-api.h")
+
+function(read_download_entry section key out_var)
+  set(_downloads_file "${THIRD_PARTY_ROOT}/downloads")
+  if(NOT EXISTS "${_downloads_file}")
+    message(FATAL_ERROR "missing third-party downloads manifest: ${_downloads_file}")
+  endif()
+
+  file(STRINGS "${_downloads_file}" _download_lines)
+  set(_in_requested_section FALSE)
+  foreach(_download_line IN LISTS _download_lines)
+    string(STRIP "${_download_line}" _download_line)
+    if(_download_line STREQUAL "" OR _download_line MATCHES "^#")
+      continue()
+    endif()
+    if(_download_line MATCHES "^\\[([^]]+)\\]$")
+      set(_in_requested_section FALSE)
+      if(CMAKE_MATCH_1 STREQUAL "${section}")
+        set(_in_requested_section TRUE)
+      endif()
+      continue()
+    endif()
+    if(_in_requested_section AND _download_line MATCHES "^${key}=(.*)$")
+      set(${out_var} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+
+  message(FATAL_ERROR "missing ${key}= entry in [${section}] of ${_downloads_file}")
+endfunction()
+
+function(require_archive_from_downloads section out_archive)
+  read_download_entry("${section}" archive _archive)
+  read_download_entry("${section}" sha256 _expected_sha256)
+
+  set(_archive_path "${THIRD_PARTY_ROOT}/archives/${_archive}")
+  if(NOT EXISTS "${_archive_path}")
+    message(FATAL_ERROR "missing third-party archive: ${_archive_path}")
+  endif()
+
+  file(SHA256 "${_archive_path}" _actual_sha256)
+  if(NOT _actual_sha256 STREQUAL _expected_sha256)
+    message(FATAL_ERROR
+      "sha256 mismatch for ${_archive}: expected ${_expected_sha256}, got ${_actual_sha256}"
+    )
+  endif()
+
+  set(${out_archive} "${_archive}" PARENT_SCOPE)
+endfunction()
 
 function(extract_third_party_source name archive strip_components)
   set(source_dir "${THIRD_PARTY_SOURCE_ROOT}/${name}")
@@ -106,7 +160,19 @@ function(build_cmake_third_party name)
   endif()
 endfunction()
 
+set(THIRD_PARTY_ABSL_CRC_READY FALSE)
+if(EXISTS "${THIRD_PARTY_ABSL_CRC_LIB}")
+  execute_process(
+    COMMAND head -c 8 "${THIRD_PARTY_ABSL_CRC_LIB}"
+    OUTPUT_VARIABLE _absl_crc_archive_header
+  )
+  if(_absl_crc_archive_header STREQUAL "!<arch>\n")
+    set(THIRD_PARTY_ABSL_CRC_READY TRUE)
+  endif()
+endif()
+
 if(NOT EXISTS "${THIRD_PARTY_APM_LIB}" OR NOT EXISTS "${THIRD_PARTY_AC_LIB}" OR
+   NOT THIRD_PARTY_ABSL_CRC_READY OR
    NOT EXISTS "${THIRD_PARTY_APM_PC}" OR NOT EXISTS "${THIRD_PARTY_AC_PC}")
   message(STATUS "Preparing vendored webrtc-audio-processing")
   execute_process(
@@ -123,9 +189,13 @@ else()
   message(STATUS "Vendored webrtc-audio-processing already prepared")
 endif()
 
-extract_third_party_source(ixwebsocket ixwebsocket-v11.4.5.tar.gz 1)
-extract_third_party_source(nlohmann_json nlohmann_json-v3.11.3.tar.xz 1)
-extract_third_party_source(spdlog spdlog-v1.15.1.tar.gz 1)
+require_archive_from_downloads(ixwebsocket THIRD_PARTY_IXWEBSOCKET_ARCHIVE)
+require_archive_from_downloads(nlohmann_json THIRD_PARTY_NLOHMANN_JSON_ARCHIVE)
+require_archive_from_downloads(spdlog THIRD_PARTY_SPDLOG_ARCHIVE)
+
+extract_third_party_source(ixwebsocket "${THIRD_PARTY_IXWEBSOCKET_ARCHIVE}" 1)
+extract_third_party_source(nlohmann_json "${THIRD_PARTY_NLOHMANN_JSON_ARCHIVE}" 1)
+extract_third_party_source(spdlog "${THIRD_PARTY_SPDLOG_ARCHIVE}" 1)
 
 build_cmake_third_party(nlohmann_json
   SOURCE_DIR "${THIRD_PARTY_SOURCE_ROOT}/nlohmann_json"
@@ -170,3 +240,74 @@ build_cmake_third_party(ixwebsocket
     -DUSE_TLS=ON
     -DUSE_ZLIB=ON
 )
+
+require_archive_from_downloads(sherpa-onnx THIRD_PARTY_SHERPA_ONNX_ARCHIVE)
+extract_third_party_source(sherpa-onnx "${THIRD_PARTY_SHERPA_ONNX_ARCHIVE}" 1)
+
+if(NOT EXISTS "${THIRD_PARTY_SHERPA_ONNX_CXX_API}" OR
+   NOT EXISTS "${THIRD_PARTY_SHERPA_ONNX_C_API}" OR
+   NOT EXISTS "${THIRD_PARTY_ONNXRUNTIME_LIB}" OR
+   NOT EXISTS "${THIRD_PARTY_SHERPA_ONNX_HEADER}")
+  message(STATUS "Preparing vendored sherpa-onnx shared runtime")
+  set(_sherpa_build_dir "${THIRD_PARTY_BUILD_ROOT}/sherpa-onnx-x64-shared")
+  file(MAKE_DIRECTORY "${_sherpa_build_dir}")
+
+  foreach(_sherpa_dependency_section
+      sherpa-onnxruntime
+      sherpa-kaldi-native-fbank
+      sherpa-kissfft
+      sherpa-kaldi-decoder
+      sherpa-kaldifst
+      sherpa-openfst
+      sherpa-eigen
+      sherpa-simple-sentencepiece
+      sherpa-json)
+    require_archive_from_downloads("${_sherpa_dependency_section}" _sherpa_archive)
+    if(EXISTS "${_sherpa_build_dir}/${_sherpa_archive}" OR
+       IS_SYMLINK "${_sherpa_build_dir}/${_sherpa_archive}")
+      file(REMOVE "${_sherpa_build_dir}/${_sherpa_archive}")
+    endif()
+    file(CREATE_LINK
+      "${THIRD_PARTY_ROOT}/archives/${_sherpa_archive}"
+      "${_sherpa_build_dir}/${_sherpa_archive}"
+      SYMBOLIC
+    )
+  endforeach()
+
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+      -S "${THIRD_PARTY_SOURCE_ROOT}/sherpa-onnx"
+      -B "${_sherpa_build_dir}"
+      -DCMAKE_BUILD_TYPE=${THIRD_PARTY_CMAKE_BUILD_TYPE}
+      -DCMAKE_INSTALL_PREFIX=${THIRD_PARTY_SHERPA_ONNX_INSTALL_ROOT}
+      -DBUILD_SHARED_LIBS=ON
+      -DSHERPA_ONNX_ENABLE_C_API=ON
+      -DSHERPA_ONNX_ENABLE_BINARY=OFF
+      -DSHERPA_ONNX_ENABLE_TESTS=OFF
+      -DSHERPA_ONNX_ENABLE_PYTHON=OFF
+      -DSHERPA_ONNX_ENABLE_TTS=OFF
+      -DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=OFF
+      -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF
+      -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF
+    WORKING_DIRECTORY "${THIRD_PARTY_ROOT}/.."
+    RESULT_VARIABLE _sherpa_configure_result
+  )
+  if(NOT _sherpa_configure_result EQUAL 0)
+    message(FATAL_ERROR "failed to configure vendored sherpa-onnx")
+  endif()
+
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+      --build "${_sherpa_build_dir}"
+      --target install
+      --config "${THIRD_PARTY_CMAKE_BUILD_TYPE}"
+      --parallel "${THIRD_PARTY_BUILD_JOBS}"
+    WORKING_DIRECTORY "${THIRD_PARTY_ROOT}/.."
+    RESULT_VARIABLE _sherpa_build_result
+  )
+  if(NOT _sherpa_build_result EQUAL 0)
+    message(FATAL_ERROR "failed to build and install vendored sherpa-onnx")
+  endif()
+else()
+  message(STATUS "Vendored sherpa-onnx already prepared")
+endif()
