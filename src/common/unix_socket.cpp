@@ -1,4 +1,4 @@
-#include "audio_processing_module/unix_socket.hpp"
+#include "common/unix_socket.hpp"
 
 #include <poll.h>
 #include <sys/socket.h>

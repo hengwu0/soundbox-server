@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(AudioProcessingModule LANGUAGES CXX)
+project(soundbox-server LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,12 +55,15 @@ add_custom_target(third_party_webrtc_apm
 )
 
 add_library(audio_processing_module
-  src/application.cpp
-  src/audio_frame.cpp
-  src/modules.cpp
-  src/unix_socket.cpp
-  src/wav_writer.cpp
-  src/webrtc_processor.cpp
+  src/apm/aec/aec_stream_processor.cpp
+  src/apm/aec/webrtc_processor.cpp
+  src/apm/kws/kws_placeholder.cpp
+  src/common/audio_frame.cpp
+  src/common/unix_socket.cpp
+  src/common/wav_writer.cpp
+  src/config/application.cpp
+  src/frontend/audio_stream_frontend.cpp
+  src/llm/file_recorder.cpp
 )
 
 target_include_directories(audio_processing_module
@@ -92,16 +95,16 @@ target_link_libraries(audio_processing_module
 
 add_dependencies(audio_processing_module third_party_webrtc_apm)
 
-add_executable(AudioProcessingModule
+add_executable(soundbox-server
   src/main.cpp
 )
 
-target_link_libraries(AudioProcessingModule
+target_link_libraries(soundbox-server
   PRIVATE
     audio_processing_module
 )
 
-add_dependencies(AudioProcessingModule third_party_webrtc_apm)
+add_dependencies(soundbox-server third_party_webrtc_apm)
 
 enable_testing()
 
@@ -120,7 +123,7 @@ add_test(NAME audio_processing_module_tests COMMAND audio_processing_module_test
 
 add_custom_target(distclean
   COMMAND ${CMAKE_COMMAND} -E rm -rf
-    "${CMAKE_BINARY_DIR}/AudioProcessingModule"
+    "${CMAKE_BINARY_DIR}/soundbox-server"
     "${CMAKE_BINARY_DIR}/audio_processing_module_tests"
     "${CMAKE_BINARY_DIR}/libaudio_processing_module.a"
     "${CMAKE_BINARY_DIR}/CMakeCache.txt"

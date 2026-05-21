@@ -20,7 +20,7 @@
 *.dylib
 *.dll
 *.exe
-/AudioProcessingModule
+/soundbox-server
 /audio_processing_module_tests
 
 # Generated third-party source, build, tool, and install trees. Release archives
@@ -31,6 +31,7 @@
 /third_party/tools/
 
 # Runtime output from system tests
+/apm.yaml
 /output/
 /logs/
 /tmp/

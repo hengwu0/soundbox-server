@@ -1,4 +1,4 @@
-#include "audio_processing_module/audio_frame.hpp"
+#include "common/audio_frame.hpp"
 
 #include <iomanip>
 #include <sstream>

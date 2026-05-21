@@ -1,7 +1,9 @@
-#include "audio_processing_module/application.hpp"
+#include "config/application.hpp"
 
-#include "audio_processing_module/modules.hpp"
-#include "audio_processing_module/webrtc_processor.hpp"
+#include "apm/aec/aec_stream_processor.hpp"
+#include "apm/aec/webrtc_processor.hpp"
+#include "frontend/audio_stream_frontend.hpp"
+#include "llm/file_recorder.hpp"
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -205,7 +207,7 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
 
   const WebRtcProcessorOptions& processor = defaults.processor;
   const PreAecAutoGainConfig& pre_aec = processor.pre_aec_auto_gain;
-  output << "# AudioProcessingModule runtime configuration.\n"
+  output << "# soundbox-server runtime configuration.\n"
          << "# Pass --config <path-or-dir> to select this file; directories use apm.yaml.\n"
          << "socket_dir: \"" << defaults.socket_dir << "\"\n"
          << "delay_ms: " << processor.delay_ms << "\n"
@@ -341,7 +343,7 @@ CliOptions ParseCliOptions(const std::vector<std::string>& args) {
     } else if (IsRemovedConfigOption(arg)) {
       throw std::runtime_error(arg + " has moved to apm.yaml; use --config <path-or-dir>");
     } else if (arg == "--help" || arg == "-h") {
-      throw std::runtime_error(Usage(args.empty() ? "AudioProcessingModule" : args[0]));
+      throw std::runtime_error(Usage(args.empty() ? "soundbox-server" : args[0]));
     } else {
       throw std::runtime_error("unknown option: " + arg);
     }
@@ -395,15 +397,15 @@ std::string Usage(const std::string& program_name) {
 
 int RunPipeline(const PipelineOptions& options) {
   std::filesystem::create_directories(options.socket_dir);
-  const std::string capture_socket =
-      (std::filesystem::path(options.socket_dir) / "capture.sock").string();
-  const std::string processed_socket =
-      (std::filesystem::path(options.socket_dir) / "processed.sock").string();
+  const std::string frontend_to_aec_socket =
+      (std::filesystem::path(options.socket_dir) / "frontend_to_aec.sock").string();
+  const std::string aec_to_llm_socket =
+      (std::filesystem::path(options.socket_dir) / "aec_to_llm.sock").string();
 
-  ModuleAFileSource module_a(options.input_file, capture_socket);
-  ModuleBWebRtcProcessor module_b(capture_socket, processed_socket,
-                                  options.processor);
-  ModuleCWavSink module_c(processed_socket, options.output_file);
+  frontend::AudioStreamFrontend frontend(options.input_file, frontend_to_aec_socket);
+  apm::aec::AecStreamProcessor aec(frontend_to_aec_socket, aec_to_llm_socket,
+                                   options.processor);
+  llm::FileRecorder llm(aec_to_llm_socket, options.output_file);
 
   std::vector<std::exception_ptr> errors(3);
   std::mutex error_mutex;
@@ -417,13 +419,13 @@ int RunPipeline(const PipelineOptions& options) {
     }
   };
 
-  std::thread thread_a([&] { run_thread(0, [&] { module_a.Run(); }); });
-  std::thread thread_b([&] { run_thread(1, [&] { module_b.Run(); }); });
-  std::thread thread_c([&] { run_thread(2, [&] { module_c.Run(); }); });
+  std::thread llm_thread([&] { run_thread(2, [&] { llm.Run(); }); });
+  std::thread aec_thread([&] { run_thread(1, [&] { aec.Run(); }); });
+  std::thread frontend_thread([&] { run_thread(0, [&] { frontend.Run(); }); });
 
-  thread_a.join();
-  thread_b.join();
-  thread_c.join();
+  frontend_thread.join();
+  aec_thread.join();
+  llm_thread.join();
 
   RethrowFirstError(errors);
   std::cout << "[main] pipeline completed successfully\n";

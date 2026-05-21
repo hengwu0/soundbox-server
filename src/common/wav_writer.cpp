@@ -1,4 +1,4 @@
-#include "audio_processing_module/wav_writer.hpp"
+#include "common/wav_writer.hpp"
 
 #include <filesystem>
 #include <limits>

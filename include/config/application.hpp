@@ -1,11 +1,18 @@
 #pragma once
 
-#include "audio_processing_module/modules.hpp"
+#include "apm/aec/webrtc_processor.hpp"
 
 #include <string>
 #include <vector>
 
 namespace audio_processing_module {
+
+struct PipelineOptions {
+  std::string input_file;
+  std::string output_file;
+  std::string socket_dir;
+  WebRtcProcessorOptions processor;
+};
 
 PipelineOptions ParseOptions(const std::vector<std::string>& args);
 

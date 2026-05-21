@@ -1,4 +1,4 @@
-#include "audio_processing_module/application.hpp"
+#include "config/application.hpp"
 
 #include <exception>
 #include <iostream>

@@ -1,4 +1,4 @@
-#include "audio_processing_module/webrtc_processor.hpp"
+#include "apm/aec/webrtc_processor.hpp"
 
 #include "modules/audio_processing/include/audio_processing.h"
 

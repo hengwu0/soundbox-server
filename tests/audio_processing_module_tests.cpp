@@ -1,7 +1,10 @@
-#include "audio_processing_module/application.hpp"
-#include "audio_processing_module/audio_frame.hpp"
-#include "audio_processing_module/wav_writer.hpp"
-#include "audio_processing_module/webrtc_processor.hpp"
+#include "apm/aec/aec_stream_processor.hpp"
+#include "apm/aec/webrtc_processor.hpp"
+#include "common/audio_frame.hpp"
+#include "common/wav_writer.hpp"
+#include "config/application.hpp"
+#include "frontend/audio_stream_frontend.hpp"
+#include "llm/file_recorder.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +28,9 @@ using audio_processing_module::SplitInterleavedStereoS16;
 using audio_processing_module::StereoSplit;
 using audio_processing_module::WavWriter;
 using audio_processing_module::WebRtcProcessorOptions;
+using audio_processing_module::apm::aec::AecStreamProcessor;
+using audio_processing_module::frontend::AudioStreamFrontend;
+using audio_processing_module::llm::FileRecorder;
 
 namespace {
 
@@ -104,6 +110,26 @@ void TestStereoFrameSplitKeepsMicAndReferenceOrder() {
           "reference channel was not split from channel 1");
 }
 
+void TestNewPipelineModulesExposeExpectedSocketRoles() {
+  // 验证新结构的三段职责：frontend 连接 AEC；AEC 监听 frontend 并连接 LLM；LLM 监听 AEC。
+  const std::string frontend_to_aec = "/tmp/frontend_to_aec.sock";
+  const std::string aec_to_llm = "/tmp/aec_to_llm.sock";
+  const std::string output = "/tmp/audio_processing_module_roles.wav";
+
+  AudioStreamFrontend frontend("tests/aec_2ch_16k.s16", frontend_to_aec);
+  AecStreamProcessor aec(frontend_to_aec, aec_to_llm, WebRtcProcessorOptions{});
+  FileRecorder recorder(aec_to_llm, output);
+
+  Require(frontend.aec_socket_path() == frontend_to_aec,
+          "frontend should connect to the AEC listen socket");
+  Require(aec.frontend_listen_socket_path() == frontend_to_aec,
+          "AEC should own the frontend-facing listen socket");
+  Require(aec.llm_socket_path() == aec_to_llm,
+          "AEC should connect to the LLM listen socket");
+  Require(recorder.listen_socket_path() == aec_to_llm,
+          "LLM recorder should own the AEC-facing listen socket");
+}
+
 void TestWavWriterPatchesHeaderAfterStreamingSamples() {
   // 验证 WAV sink 能先流式写样本，关闭时再回填 RIFF/data 长度。
   const std::string path = "/tmp/audio_processing_module_test.wav";
@@ -136,7 +162,7 @@ void TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory() {
   ScopedCurrentPath current_path_guard(temp_root);
 
   const std::vector<std::string> args = {
-      "AudioProcessingModule",
+      "soundbox-server",
       "--input", original_input.string(),
   };
 
@@ -146,7 +172,7 @@ void TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory() {
           "default config file was not created in cwd");
   Require(StartsWith(options.socket_dir, "/tmp/audio_processing_module_"),
           "default socket dir was not loaded from generated config");
-  Require(options.processor.delay_ms == 0, "default delay_ms should remain zero");
+  Require(options.processor.delay_ms == 2, "default delay_ms should remain two milliseconds");
   Require(options.processor.ns_level == WebRtcProcessorOptions::NoiseSuppressionLevel::kHigh,
           "default ns level should remain high");
   Require(options.processor.agc_mode == WebRtcProcessorOptions::AgcMode::kAdaptiveDigital,
@@ -175,7 +201,7 @@ void TestParseOptionsLoadsConfigurationFromDirectory() {
                   "agc_limiter_enabled: false\n");
 
   const std::vector<std::string> args = {
-      "AudioProcessingModule",
+      "soundbox-server",
       "--config", config_dir.string(),
       "--input", input_file.string(),
   };
@@ -211,7 +237,7 @@ void TestParseOptionsCreatesConfigFileAtExplicitYamlPath() {
   const std::filesystem::path input_file = std::filesystem::absolute("tests/aec_2ch_16k.s16");
 
   const std::vector<std::string> args = {
-      "AudioProcessingModule",
+      "soundbox-server",
       "--config", config_file.string(),
       "--input", input_file.string(),
   };
@@ -233,7 +259,7 @@ void TestParseOptionsCreatesConfigFileAtExplicitYamlPath() {
 void TestParseOptionsRejectsRemovedTuningFlags() {
   // 验证原来直接从命令行传入的调参项已经被移除，并会提示改用配置文件。
   const std::vector<std::string> args = {
-      "AudioProcessingModule",
+      "soundbox-server",
       "--input", "tests/aec_2ch_16k.s16",
       "--delay-ms", "32",
   };
@@ -282,6 +308,7 @@ void TestPreAecAutoGainRaisesSmallMicFrameWithoutClipping() {
 int main() {
   try {
     TestStereoFrameSplitKeepsMicAndReferenceOrder();
+    TestNewPipelineModulesExposeExpectedSocketRoles();
     TestWavWriterPatchesHeaderAfterStreamingSamples();
     TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory();
     TestParseOptionsLoadsConfigurationFromDirectory();

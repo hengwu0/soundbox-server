@@ -1,6 +1,6 @@
 #pragma once
 
-#include "audio_processing_module/audio_frame.hpp"
+#include "common/audio_frame.hpp"
 
 #include <cstdint>
 #include <memory>
