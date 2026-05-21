@@ -11,6 +11,23 @@ tools_root="${script_dir}/tools"
 
 version="1.3"
 default_library="${DEFAULT_LIBRARY:-static}"
+build_jobs="${THIRD_PARTY_BUILD_JOBS:-}"
+
+if [[ -z "${build_jobs}" ]]; then
+  if command -v nproc >/dev/null 2>&1; then
+    cpu_count="$(nproc)"
+  else
+    cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  fi
+  if [[ "${cpu_count}" =~ ^[0-9]+$ ]]; then
+    build_jobs=$((cpu_count / 2))
+    if [[ "${build_jobs}" -lt 1 ]]; then
+      build_jobs=1
+    fi
+  else
+    build_jobs=1
+  fi
+fi
 
 webrtc_section="webrtc-audio-processing"
 abseil_section="abseil-cpp"
@@ -147,7 +164,7 @@ if [[ ! -f "${build_dir}/build.ninja" ]]; then
     --force-fallback-for=absl_base,absl_flags,absl_strings,absl_synchronization,absl_bad_optional_access
 fi
 
-python3 -m mesonbuild.mesonmain compile -C "${build_dir}"
+python3 -m mesonbuild.mesonmain compile -C "${build_dir}" -j "${build_jobs}"
 python3 -m mesonbuild.mesonmain install -C "${build_dir}"
 
 cat <<EOF

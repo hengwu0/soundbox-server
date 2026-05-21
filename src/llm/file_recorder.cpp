@@ -21,6 +21,8 @@ FileRecorder::FileRecorder(std::string listen_socket_path, std::string output_fi
       output_file_(std::move(output_file)) {}
 
 void FileRecorder::Run() {
+  // FileRecorder is a single-client sink: only the current AEC stream should
+  // connect to this socket, so no client list or broadcast path is needed.
   FileDescriptor server = CreateUnixServerSocket(listen_socket_path_, 1);
   SocketPathGuard guard(listen_socket_path_);
   std::cout << "[llm] processed audio listen ready: " << listen_socket_path_

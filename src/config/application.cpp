@@ -1,8 +1,9 @@
 #include "config/application.hpp"
 
 #include "apm/aec/aec_stream_processor.hpp"
+#include "apm/kws/kws_socket_server.hpp"
 #include "apm/aec/webrtc_processor.hpp"
-#include "frontend/audio_stream_frontend.hpp"
+#include "frontend/soundbox_frontend.hpp"
 #include "llm/file_recorder.hpp"
 
 #include <sys/types.h>
@@ -14,7 +15,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,6 +26,20 @@
 
 namespace audio_processing_module {
 namespace {
+
+class PassiveKwsEngine final : public xiaoai_server::wakeup::IKwsEngine {
+ public:
+  std::optional<xiaoai_server::wakeup::KwsHit> AcceptPcm16(
+      const uint8_t* /*pcm*/,
+      size_t /*size_bytes*/,
+      int /*sample_rate*/,
+      int /*channels*/,
+      int /*bits_per_sample*/) override {
+    return std::nullopt;
+  }
+
+  void Reset() override {}
+};
 
 struct CliOptions {
   std::string input_file;
@@ -210,19 +227,61 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
   output << "# soundbox-server runtime configuration.\n"
          << "# Pass --config <path-or-dir> to select this file; directories use apm.yaml.\n"
          << "socket_dir: \"" << defaults.socket_dir << "\"\n"
-         << "delay_ms: " << processor.delay_ms << "\n"
-         << "pre_aec_auto_gain:\n"
-         << "  enabled: " << (pre_aec.enabled ? "true" : "false") << "\n"
-         << "  target_rms: " << pre_aec.target_rms << "\n"
-         << "  max_gain: " << pre_aec.max_gain << "\n"
-         << "  attack: " << pre_aec.attack << "\n"
-         << "  release: " << pre_aec.release << "\n"
-         << "ns_level: " << FormatNoiseSuppressionLevel(processor.ns_level) << "\n"
-         << "agc_mode: " << FormatAgcMode(processor.agc_mode) << "\n"
-         << "agc_target_dbfs: " << processor.agc_target_level_dbfs << "\n"
-         << "agc_compression_gain_db: " << processor.agc_compression_gain_db << "\n"
-         << "agc_limiter_enabled: "
-         << (processor.agc_limiter_enabled ? "true" : "false") << "\n";
+         << "soundbox:\n"
+         << "  ws_url: \"\"\n"
+         << "  ws_token: \"\"\n"
+         << "  connect_timeout_ms: "
+         << defaults.runtime.soundbox.connect_timeout_ms << "\n"
+         << "  llm_start_timeout_ms: 1000\n"
+         << "  llm_stop_timeout_ms: 1000\n"
+         << "wakeup:\n"
+         << "  say_hello: \"" << defaults.runtime.wakeup.say_hello << "\"\n"
+         << "  keywords_file: \"" << defaults.runtime.wakeup.keywords_file << "\"\n"
+         << "  tokens_path: \"" << defaults.runtime.wakeup.tokens_path << "\"\n"
+         << "  encoder_path: \"" << defaults.runtime.wakeup.encoder_path << "\"\n"
+         << "  decoder_path: \"" << defaults.runtime.wakeup.decoder_path << "\"\n"
+         << "  joiner_path: \"" << defaults.runtime.wakeup.joiner_path << "\"\n"
+         << "  kws_threshold: " << defaults.runtime.wakeup.kws_threshold << "\n"
+         << "  kws_score: " << defaults.runtime.wakeup.kws_score << "\n"
+         << "  kws_num_threads: " << defaults.runtime.wakeup.kws_num_threads << "\n"
+         << "  kws_max_active_paths: "
+         << defaults.runtime.wakeup.kws_max_active_paths << "\n"
+         << "  kws_num_trailing_blanks: "
+         << defaults.runtime.wakeup.kws_num_trailing_blanks << "\n"
+         << "  min_trigger_interval_ms: "
+         << defaults.runtime.wakeup.min_trigger_interval_ms << "\n"
+         << "playback:\n"
+         << "  sample_rate: " << defaults.runtime.xiaozhi.downlink_sample_rate << "\n"
+         << "  channels: 1\n"
+         << "  bits_per_sample: 16\n"
+         << "aec:\n"
+         << "  delay_ms: " << processor.delay_ms << "\n"
+         << "  pre_aec_auto_gain:\n"
+         << "    enabled: " << (pre_aec.enabled ? "true" : "false") << "\n"
+         << "    target_rms: " << pre_aec.target_rms << "\n"
+         << "    max_gain: " << pre_aec.max_gain << "\n"
+         << "    attack: " << pre_aec.attack << "\n"
+         << "    release: " << pre_aec.release << "\n"
+         << "  ns_level: " << FormatNoiseSuppressionLevel(processor.ns_level) << "\n"
+         << "  agc_mode: " << FormatAgcMode(processor.agc_mode) << "\n"
+         << "  agc_target_dbfs: " << processor.agc_target_level_dbfs << "\n"
+         << "  agc_compression_gain_db: " << processor.agc_compression_gain_db << "\n"
+         << "  agc_limiter_enabled: "
+         << (processor.agc_limiter_enabled ? "true" : "false") << "\n"
+         << "budget:\n"
+         << "  input_queue_frames: " << defaults.runtime.budget.input_queue_frames << "\n"
+         << "  output_queue_frames: "
+         << defaults.runtime.budget.output_queue_frames << "\n"
+         << "  reconnect_backoff_min_ms: "
+         << defaults.runtime.budget.reconnect_backoff_min_ms << "\n"
+         << "  reconnect_backoff_max_ms: "
+         << defaults.runtime.budget.reconnect_backoff_max_ms << "\n"
+         << "log:\n"
+         << "  enable_debug: "
+         << (defaults.runtime.log.enable_debug ? "true" : "false") << "\n"
+         << "  file_enabled: "
+         << (defaults.runtime.log.file_enabled ? "true" : "false") << "\n"
+         << "  file_path: \"" << defaults.runtime.log.file_path << "\"\n";
 
   if (!output.good()) {
     throw std::runtime_error("failed to write config file: " + config_file.string());
@@ -237,28 +296,87 @@ void ApplyConfigEntry(PipelineOptions* options,
 
   if (key == "socket_dir") {
     options->socket_dir = value;
-  } else if (key == "delay_ms") {
+  } else if (key == "soundbox.ws_url") {
+    options->runtime.soundbox.ws_url = value;
+  } else if (key == "soundbox.ws_token") {
+    options->runtime.soundbox.ws_token = value;
+  } else if (key == "soundbox.connect_timeout_ms") {
+    options->runtime.soundbox.connect_timeout_ms = ParseInt(value, key);
+  } else if (key == "soundbox.llm_start_timeout_ms" ||
+             key == "soundbox.llm_stop_timeout_ms") {
+    (void)ParseInt(value, key);
+  } else if (key == "wakeup.say_hello") {
+    options->runtime.wakeup.say_hello = value;
+  } else if (key == "wakeup.keywords_file") {
+    options->runtime.wakeup.keywords_file = value;
+  } else if (key == "wakeup.tokens_path") {
+    options->runtime.wakeup.tokens_path = value;
+  } else if (key == "wakeup.encoder_path") {
+    options->runtime.wakeup.encoder_path = value;
+  } else if (key == "wakeup.decoder_path") {
+    options->runtime.wakeup.decoder_path = value;
+  } else if (key == "wakeup.joiner_path") {
+    options->runtime.wakeup.joiner_path = value;
+  } else if (key == "wakeup.kws_threshold") {
+    options->runtime.wakeup.kws_threshold = ParseFloat(value, key);
+  } else if (key == "wakeup.kws_score") {
+    options->runtime.wakeup.kws_score = ParseFloat(value, key);
+  } else if (key == "wakeup.kws_num_threads") {
+    options->runtime.wakeup.kws_num_threads = ParseInt(value, key);
+  } else if (key == "wakeup.kws_max_active_paths") {
+    options->runtime.wakeup.kws_max_active_paths = ParseInt(value, key);
+  } else if (key == "wakeup.kws_num_trailing_blanks") {
+    options->runtime.wakeup.kws_num_trailing_blanks = ParseInt(value, key);
+  } else if (key == "wakeup.min_trigger_interval_ms") {
+    options->runtime.wakeup.min_trigger_interval_ms = ParseInt(value, key);
+  } else if (key == "playback.sample_rate") {
+    options->runtime.xiaozhi.downlink_sample_rate = ParseInt(value, key);
+  } else if (key == "playback.channels" || key == "playback.bits_per_sample") {
+    (void)ParseInt(value, key);
+  } else if (key == "delay_ms" || key == "aec.delay_ms") {
     processor.delay_ms = ParseInt(value, key);
-  } else if (key == "pre_aec_auto_gain.enabled") {
+  } else if (key == "pre_aec_auto_gain.enabled" ||
+             key == "aec.pre_aec_auto_gain.enabled") {
     pre_aec.enabled = ParseBool(value, key);
-  } else if (key == "pre_aec_auto_gain.target_rms") {
+  } else if (key == "pre_aec_auto_gain.target_rms" ||
+             key == "aec.pre_aec_auto_gain.target_rms") {
     pre_aec.target_rms = ParseFloat(value, key);
-  } else if (key == "pre_aec_auto_gain.max_gain") {
+  } else if (key == "pre_aec_auto_gain.max_gain" ||
+             key == "aec.pre_aec_auto_gain.max_gain") {
     pre_aec.max_gain = ParseFloat(value, key);
-  } else if (key == "pre_aec_auto_gain.attack") {
+  } else if (key == "pre_aec_auto_gain.attack" ||
+             key == "aec.pre_aec_auto_gain.attack") {
     pre_aec.attack = ParseFloat(value, key);
-  } else if (key == "pre_aec_auto_gain.release") {
+  } else if (key == "pre_aec_auto_gain.release" ||
+             key == "aec.pre_aec_auto_gain.release") {
     pre_aec.release = ParseFloat(value, key);
-  } else if (key == "ns_level") {
+  } else if (key == "ns_level" || key == "aec.ns_level") {
     processor.ns_level = ParseNoiseSuppressionLevel(value);
-  } else if (key == "agc_mode") {
+  } else if (key == "agc_mode" || key == "aec.agc_mode") {
     processor.agc_mode = ParseAgcMode(value);
-  } else if (key == "agc_target_dbfs" || key == "agc_target_level_dbfs") {
+  } else if (key == "agc_target_dbfs" || key == "agc_target_level_dbfs" ||
+             key == "aec.agc_target_dbfs" || key == "aec.agc_target_level_dbfs") {
     processor.agc_target_level_dbfs = ParseInt(value, key);
-  } else if (key == "agc_compression_gain_db") {
+  } else if (key == "agc_compression_gain_db" ||
+             key == "aec.agc_compression_gain_db") {
     processor.agc_compression_gain_db = ParseInt(value, key);
-  } else if (key == "agc_limiter_enabled") {
+  } else if (key == "agc_limiter_enabled" ||
+             key == "aec.agc_limiter_enabled") {
     processor.agc_limiter_enabled = ParseBool(value, key);
+  } else if (key == "budget.input_queue_frames") {
+    options->runtime.budget.input_queue_frames = ParseInt(value, key);
+  } else if (key == "budget.output_queue_frames") {
+    options->runtime.budget.output_queue_frames = ParseInt(value, key);
+  } else if (key == "budget.reconnect_backoff_min_ms") {
+    options->runtime.budget.reconnect_backoff_min_ms = ParseInt(value, key);
+  } else if (key == "budget.reconnect_backoff_max_ms") {
+    options->runtime.budget.reconnect_backoff_max_ms = ParseInt(value, key);
+  } else if (key == "log.enable_debug") {
+    options->runtime.log.enable_debug = ParseBool(value, key);
+  } else if (key == "log.file_enabled") {
+    options->runtime.log.file_enabled = ParseBool(value, key);
+  } else if (key == "log.file_path") {
+    options->runtime.log.file_path = value;
   } else {
     throw std::runtime_error("unknown config key: " + key);
   }
@@ -273,6 +391,7 @@ void LoadConfigFile(const std::filesystem::path& config_file,
 
   std::string line;
   std::string section;
+  std::string subsection;
   size_t line_number = 0;
   while (std::getline(input, line)) {
     ++line_number;
@@ -289,9 +408,8 @@ void LoadConfigFile(const std::filesystem::path& config_file,
                                std::to_string(line_number) + ": " + content);
     }
 
-    const bool indented =
-        !uncommented.empty() &&
-        std::isspace(static_cast<unsigned char>(uncommented.front()));
+    const size_t indent = uncommented.find_first_not_of(" \t");
+    const bool indented = indent > 0;
     const std::string raw_key = Trim(content.substr(0, separator));
     const std::string raw_value = Trim(content.substr(separator + 1));
     if (raw_key.empty()) {
@@ -299,11 +417,16 @@ void LoadConfigFile(const std::filesystem::path& config_file,
                                std::to_string(line_number) + ": " + content);
     }
     if (raw_value.empty()) {
-      if (indented) {
-        throw std::runtime_error("invalid config line " +
-                                 std::to_string(line_number) + ": " + content);
+      if (!indented) {
+        section = raw_key;
+        subsection.clear();
+        continue;
       }
-      section = raw_key;
+      if (section.empty()) {
+        throw std::runtime_error("config line " + std::to_string(line_number) +
+                                 " is indented without a parent section");
+      }
+      subsection = raw_key;
       continue;
     }
 
@@ -313,9 +436,14 @@ void LoadConfigFile(const std::filesystem::path& config_file,
         throw std::runtime_error("config line " + std::to_string(line_number) +
                                  " is indented without a parent section");
       }
-      key = section + "." + raw_key;
+      if (indent >= 4 && !subsection.empty()) {
+        key = section + "." + subsection + "." + raw_key;
+      } else {
+        key = section + "." + raw_key;
+      }
     } else {
       section.clear();
+      subsection.clear();
     }
 
     ApplyConfigEntry(options, key, Unquote(raw_value));
@@ -326,6 +454,7 @@ PipelineOptions DefaultPipelineOptions() {
   PipelineOptions options;
   options.output_file = "output/aec_processed.wav";
   options.socket_dir = DefaultSocketDir();
+  options.runtime.log.file_path = "logs/soundbox_server.log";
   return options;
 }
 
@@ -380,34 +509,63 @@ PipelineOptions ParseOptions(const std::vector<std::string>& args) {
     options.input_file = cli_options.input_file;
   }
 
-  if (options.input_file.empty()) {
-    throw std::runtime_error("required option is missing: --input <2ch-s16le-pcm-file>");
-  }
-
   return options;
 }
 
 std::string Usage(const std::string& program_name) {
   std::ostringstream output;
   output << "Usage: " << program_name
-         << " --input <2ch_16bit_16k.s16> [--output <processed.wav>]"
+         << " [--output <processed.wav>]"
          << " [--config <apm.yaml|config-dir>]\n";
   return output.str();
 }
 
 int RunPipeline(const PipelineOptions& options) {
+  if (options.runtime.soundbox.ws_url.empty()) {
+    throw std::runtime_error("missing required config: soundbox.ws_url");
+  }
+  if (options.runtime.soundbox.ws_token.empty()) {
+    throw std::runtime_error("missing required config: soundbox.ws_token");
+  }
+  const std::vector<std::string> required_kws_files = {
+      options.runtime.wakeup.keywords_file,
+      options.runtime.wakeup.tokens_path,
+      options.runtime.wakeup.encoder_path,
+      options.runtime.wakeup.decoder_path,
+      options.runtime.wakeup.joiner_path,
+  };
+  for (const std::string& path : required_kws_files) {
+    if (!std::filesystem::exists(path)) {
+      throw std::runtime_error("missing required KWS asset: " + path);
+    }
+  }
+
   std::filesystem::create_directories(options.socket_dir);
-  const std::string frontend_to_aec_socket =
-      (std::filesystem::path(options.socket_dir) / "frontend_to_aec.sock").string();
-  const std::string aec_to_llm_socket =
-      (std::filesystem::path(options.socket_dir) / "aec_to_llm.sock").string();
+  const std::string frontend_kws_socket =
+      (std::filesystem::path(options.socket_dir) / "frontend_kws.sock").string();
+  const std::string frontend_aec_socket =
+      (std::filesystem::path(options.socket_dir) / "frontend_aec.sock").string();
+  const std::string aec_llm_socket =
+      (std::filesystem::path(options.socket_dir) / "aec_llm.sock").string();
+  const std::string frontend_playback_socket =
+      (std::filesystem::path(options.socket_dir) / "frontend_playback.sock").string();
 
-  frontend::AudioStreamFrontend frontend(options.input_file, frontend_to_aec_socket);
-  apm::aec::AecStreamProcessor aec(frontend_to_aec_socket, aec_to_llm_socket,
+  llm::FileRecorder llm(aec_llm_socket, options.output_file);
+  apm::aec::AecStreamProcessor aec(frontend_aec_socket, aec_llm_socket,
                                    options.processor);
-  llm::FileRecorder llm(aec_to_llm_socket, options.output_file);
+  auto kws_engine = std::make_shared<PassiveKwsEngine>();
+  apm::kws::KwsSocketServer::Options kws_options;
+  kws_options.listen_socket_path = frontend_kws_socket;
+  apm::kws::KwsSocketServer kws(kws_options, kws_engine);
 
-  std::vector<std::exception_ptr> errors(3);
+  soundbox_server::frontend::Frontend::Options frontend_options;
+  frontend_options.kws_socket_path = frontend_kws_socket;
+  frontend_options.aec_socket_path = frontend_aec_socket;
+  frontend_options.playback_socket_path = frontend_playback_socket;
+  frontend_options.soundbox_config = options.runtime;
+  soundbox_server::frontend::Frontend frontend(frontend_options);
+
+  std::vector<std::exception_ptr> errors(4);
   std::mutex error_mutex;
 
   auto run_thread = [&](size_t index, auto&& task) {
@@ -419,11 +577,17 @@ int RunPipeline(const PipelineOptions& options) {
     }
   };
 
-  std::thread llm_thread([&] { run_thread(2, [&] { llm.Run(); }); });
+  std::thread llm_thread([&] { run_thread(0, [&] { llm.Run(); }); });
   std::thread aec_thread([&] { run_thread(1, [&] { aec.Run(); }); });
-  std::thread frontend_thread([&] { run_thread(0, [&] { frontend.Run(); }); });
+  std::thread kws_thread([&] { run_thread(2, [&] { kws.Run(); }); });
+  std::thread frontend_thread([&] { run_thread(3, [&] { frontend.Run(); }); });
 
   frontend_thread.join();
+  frontend.Stop();
+  kws.Stop();
+  if (kws_thread.joinable()) {
+    kws_thread.join();
+  }
   aec_thread.join();
   llm_thread.join();
 

@@ -1,10 +1,12 @@
 #include "apm/aec/aec_stream_processor.hpp"
 #include "apm/aec/webrtc_processor.hpp"
+#include "apm/kws/kws_socket_server.hpp"
 #include "common/audio_frame.hpp"
+#include "common/unix_socket.hpp"
 #include "common/wav_writer.hpp"
 #include "config/application.hpp"
-#include "frontend/audio_stream_frontend.hpp"
 #include "llm/file_recorder.hpp"
+#include "aec/file_audio_stream_frontend.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -13,8 +15,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -29,8 +34,9 @@ using audio_processing_module::StereoSplit;
 using audio_processing_module::WavWriter;
 using audio_processing_module::WebRtcProcessorOptions;
 using audio_processing_module::apm::aec::AecStreamProcessor;
-using audio_processing_module::frontend::AudioStreamFrontend;
+using audio_processing_module::apm::kws::KwsSocketServer;
 using audio_processing_module::llm::FileRecorder;
+using audio_processing_module::tests::aec::FileAudioStreamFrontend;
 
 namespace {
 
@@ -93,6 +99,45 @@ bool StartsWith(const std::string& value, const std::string& prefix) {
   return value.rfind(prefix, 0) == 0;
 }
 
+std::string ReadLineFromSocket(int fd) {
+  std::string line;
+  char ch = '\0';
+  while (true) {
+    const ssize_t result = ::read(fd, &ch, 1);
+    Require(result >= 0, "failed to read socket line");
+    if (result == 0 || ch == '\n') {
+      return line;
+    }
+    line.push_back(ch);
+  }
+}
+
+class FakeKwsEngine final : public xiaoai_server::wakeup::IKwsEngine {
+ public:
+  std::optional<xiaoai_server::wakeup::KwsHit> AcceptPcm16(
+      const uint8_t* /*pcm*/,
+      size_t size_bytes,
+      int sample_rate,
+      int channels,
+      int bits_per_sample) override {
+    Require(sample_rate == 16000, "KWS server should pass 16k sample rate");
+    Require(channels == 1, "KWS server should pass mono channel count");
+    Require(bits_per_sample == 16, "KWS server should pass 16-bit format");
+    bytes_seen_ += size_bytes;
+    if (bytes_seen_ >= 320) {
+      xiaoai_server::wakeup::KwsHit hit;
+      hit.keyword = "xiaoai";
+      return hit;
+    }
+    return std::nullopt;
+  }
+
+  void Reset() override { bytes_seen_ = 0; }
+
+ private:
+  size_t bytes_seen_{0};
+};
+
 void TestStereoFrameSplitKeepsMicAndReferenceOrder() {
   // 验证 2ch/16bit 交错 PCM 会被稳定拆成 mic/ref 两路单声道。
   const std::vector<int16_t> interleaved = {
@@ -116,7 +161,7 @@ void TestNewPipelineModulesExposeExpectedSocketRoles() {
   const std::string aec_to_llm = "/tmp/aec_to_llm.sock";
   const std::string output = "/tmp/audio_processing_module_roles.wav";
 
-  AudioStreamFrontend frontend("tests/aec_2ch_16k.s16", frontend_to_aec);
+  FileAudioStreamFrontend frontend("tests/aec_2ch_16k.s16", frontend_to_aec);
   AecStreamProcessor aec(frontend_to_aec, aec_to_llm, WebRtcProcessorOptions{});
   FileRecorder recorder(aec_to_llm, output);
 
@@ -128,6 +173,43 @@ void TestNewPipelineModulesExposeExpectedSocketRoles() {
           "AEC should connect to the LLM listen socket");
   Require(recorder.listen_socket_path() == aec_to_llm,
           "LLM recorder should own the AEC-facing listen socket");
+}
+
+void TestKwsSocketServerSendsSessionStartJsonLine() {
+  // 验证 KWS socket 接收单声道 PCM 后，会把 fake engine 的命中转成 session_start JSON line。
+  const std::filesystem::path temp_root = MakeTempDirectory("kws_socket");
+  const std::string socket_path = (temp_root / "frontend_kws.sock").string();
+  auto engine = std::make_shared<FakeKwsEngine>();
+
+  KwsSocketServer::Options options;
+  options.listen_socket_path = socket_path;
+  KwsSocketServer server(options, engine);
+  std::exception_ptr thread_error;
+  std::thread server_thread([&] {
+    try {
+      server.RunOneClient();
+    } catch (...) {
+      thread_error = std::current_exception();
+    }
+  });
+
+  auto client = audio_processing_module::ConnectUnixSocketWithRetry(
+      socket_path, std::chrono::seconds(10), std::chrono::milliseconds(20));
+  const std::vector<uint8_t> pcm(320, 1);
+  audio_processing_module::WriteAll(client.get(), pcm.data(), pcm.size());
+  const std::string line = ReadLineFromSocket(client.get());
+  client.reset();
+  server_thread.join();
+  if (thread_error) {
+    std::rethrow_exception(thread_error);
+  }
+
+  Require(line.find("\"type\":\"session_start\"") != std::string::npos,
+          "KWS server should send a session_start control message");
+  Require(line.find("\"reason\":\"kws_hit\"") != std::string::npos,
+          "KWS server should include kws_hit reason");
+  Require(line.find("\"keyword\":\"xiaoai\"") != std::string::npos,
+          "KWS server should include the hit keyword");
 }
 
 void TestWavWriterPatchesHeaderAfterStreamingSamples() {
@@ -309,6 +391,7 @@ int main() {
   try {
     TestStereoFrameSplitKeepsMicAndReferenceOrder();
     TestNewPipelineModulesExposeExpectedSocketRoles();
+    TestKwsSocketServerSendsSessionStartJsonLine();
     TestWavWriterPatchesHeaderAfterStreamingSamples();
     TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory();
     TestParseOptionsLoadsConfigurationFromDirectory();
