@@ -24,10 +24,10 @@ using Audio = AudioPreset;
 
 // 描述 soundbox 音箱桥接所需的连接参数。
 struct SoundBoxPreset {
-  // ws_url 指向小爱音箱侧 open-xiaoai-client 暴露的 WebSocket 地址。
-  std::string ws_url;
-  // ws_token 是 open-xiaoai-client -l 输出的 Listen code，用作 Bearer token。
-  std::string ws_token;
+  // ws_url 指向小爱音箱侧 open-xiaoai-client 暴露的 WebSocket 地址，默认直连本机网段服务。
+  std::string ws_url{"ws://192.168.0.50:4399/"};
+  // ws_token 是 open-xiaoai-client -l 输出的 Listen code，用作 Bearer token，默认沿用仓库样板值。
+  std::string ws_token{"whsn1oeo"};
   // connect_timeout_ms 是连接小爱音箱 WebSocket 的最长等待时间。
   int connect_timeout_ms{10000};
 };
