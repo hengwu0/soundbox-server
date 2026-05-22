@@ -282,6 +282,8 @@ bool SoundBoxClient::NotifyLlmStop() {
 // 读取当前音频模式。
 AudioMode SoundBoxClient::CurrentMode() const { return mode_controller_.Current(); }
 
+const std::string& SoundBoxClient::LastConnectError() const { return last_connect_error_; }
+
 // 确保连接可用。
 bool SoundBoxClient::EnsureConnection(std::chrono::milliseconds timeout) {
   if (!running_.load()) {
@@ -299,7 +301,9 @@ bool SoundBoxClient::EnsureConnection(std::chrono::milliseconds timeout) {
 // 打开 WebSocket 连接。
 bool SoundBoxClient::OpenConnection(std::chrono::milliseconds timeout) {
   auto [url, token] = ExtractUrlAndToken(cfg_.soundbox.ws_url, cfg_.soundbox.ws_token);
+  last_connect_error_.clear();
   if (url.empty()) {
+    last_connect_error_ = "soundbox.ws_url is empty: URL is required for WebSocket connection";
     return false;
   }
   response_hub_.Reset();
@@ -334,8 +338,18 @@ bool SoundBoxClient::OpenConnection(std::chrono::milliseconds timeout) {
       response_hub_.Close();
       mode_controller_.ForceEnter(AudioMode::Stopped, "connection_closed");
       if (msg->type == ix::WebSocketMessageType::Error) {
-        kLog->warn("soundbox ws error: {}", msg->errorInfo.reason);
+        const std::string reason = msg->errorInfo.reason;
+        if (reason.find("401") != std::string::npos ||
+            reason.find("403") != std::string::npos ||
+            reason.find("Unauthorized") != std::string::npos ||
+            reason.find("Forbidden") != std::string::npos) {
+          last_connect_error_ = "soundbox WebSocket token error: " + reason;
+        } else {
+          last_connect_error_ = "soundbox WebSocket url error: " + reason;
+        }
+        kLog->warn("soundbox ws error: {}", reason);
       } else {
+        last_connect_error_ = "soundbox WebSocket connection closed";
         kLog->warn("soundbox disconnected");
       }
       if (should_notify && running_.load() && callbacks_.on_connection_closed) {
@@ -361,6 +375,7 @@ bool SoundBoxClient::OpenConnection(std::chrono::milliseconds timeout) {
   if (!conn_cv_.wait_for(lock, timeout, [this]() {
         return ws_connected_ || connect_failed_ || !running_.load();
       })) {
+    last_connect_error_ = "soundbox WebSocket connect timeout: url='" + url + "'";
     kLog->error("soundbox connect timeout");
     lock.unlock();
     CloseConnection();

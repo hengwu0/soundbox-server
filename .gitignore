@@ -44,6 +44,7 @@ core.*
 # are intentionally not ignored.
 *.wav
 !tests/**/*.wav
+/tests/fixtures/aec_processed.wav
 
 # Local IDE and OS metadata
 /.cache/

@@ -64,12 +64,14 @@ bool Trigger::FireFromText(const std::string& text) {
   // matched 保存命中的原始关键词文本。
   std::string matched;
   for (const auto& it : allowed_) {
+    // 子串匹配：规范化的识别文本中任意位置包含规范化关键词即命中
     if (norm.find(it.first) != std::string::npos) {
       matched = it.second;
       break;
     }
   }
 
+  // 命中但无回调或未匹配到时返回 false
   if (!on_wake_ || matched.empty()) {
     return false;
   }
@@ -88,7 +90,7 @@ std::unordered_map<std::string, std::string> Trigger::NormalizeKeywords(
   for (const auto& keyword : keywords) {
     auto norm = NormalizeKeyword(keyword);
     if (norm.empty()) {
-      continue;
+      continue;  ///< 跳过规范化后为空的关键词。
     }
     out[norm] = keyword;
   }

@@ -1,14 +1,12 @@
 #pragma once
 
+#include "common/wav_writer.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <string>
 
-namespace audio_processing_module {
-
-class WavWriter;
-
-namespace llm {
+namespace audio_processing_module::tests::aec {
 
 class FileRecorder {
  public:
@@ -24,8 +22,8 @@ class FileRecorder {
 
  private:
   void HandleClient(int input_fd,
-                    audio_processing_module::WavWriter* writer,
-                    uint64_t* frames_written);
+                     WavWriter* writer,
+                     uint64_t* frames_written);
 
   std::string listen_socket_path_;
   std::string output_file_;
@@ -33,5 +31,4 @@ class FileRecorder {
   std::atomic<uint64_t> frames_written_{0};
 };
 
-}  // namespace llm
-}  // namespace audio_processing_module
+}  // namespace audio_processing_module::tests::aec

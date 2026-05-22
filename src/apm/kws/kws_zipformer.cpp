@@ -15,6 +15,7 @@ const auto kLog = xiaoai_server::GetLogger("kws");
 
 }  // namespace
 
+/// Zipformer 引擎内部实现，封装 sherpa-onnx API 以隔离头文件依赖。
 struct ZipformerKwsEngine::Impl {
   // spotter 是 sherpa-onnx 提供的关键词检测器实例。
   sherpa_onnx::cxx::KeywordSpotter spotter;
@@ -32,18 +33,18 @@ struct ZipformerKwsEngine::Impl {
       : spotter([&]() {
           // c 是传给 sherpa-onnx 的完整 KWS 模型和解码配置。
           sherpa_onnx::cxx::KeywordSpotterConfig c;
-          c.model_config.model_type = "zipformer2";
-          c.model_config.tokens = cfg.tokens_path;
-          c.model_config.transducer.encoder = cfg.encoder_path;
-          c.model_config.transducer.decoder = cfg.decoder_path;
-          c.model_config.transducer.joiner = cfg.joiner_path;
-          c.model_config.num_threads = cfg.kws_num_threads;
-          c.model_config.provider = "cpu";
-          c.keywords_threshold = cfg.kws_threshold;
-          c.keywords_score = cfg.kws_score;
-          c.num_trailing_blanks = cfg.kws_num_trailing_blanks;
-          c.max_active_paths = cfg.kws_max_active_paths;
-          c.keywords_file = cfg.keywords_file;
+          c.model_config.model_type = "zipformer2";              ///< 模型架构类型。
+          c.model_config.tokens = cfg.tokens_path;               ///< 词表文件路径。
+          c.model_config.transducer.encoder = cfg.encoder_path;  ///< 编码器模型路径。
+          c.model_config.transducer.decoder = cfg.decoder_path;  ///< 解码器模型路径。
+          c.model_config.transducer.joiner = cfg.joiner_path;    ///< Joiner 模型路径。
+          c.model_config.num_threads = cfg.kws_num_threads;      ///< 推理线程数。
+          c.model_config.provider = "cpu";                       ///< 推理后端为 CPU。
+          c.keywords_threshold = cfg.kws_threshold;              ///< 关键词检测阈值。
+          c.keywords_score = cfg.kws_score;                      ///< 关键词得分阈值。
+          c.num_trailing_blanks = cfg.kws_num_trailing_blanks;   ///< 尾部空白帧数。
+          c.max_active_paths = cfg.kws_max_active_paths;         ///< 最大活跃路径数。
+          c.keywords_file = cfg.keywords_file;                   ///< 关键词列表文件路径。
           kLog->info(
               "kws config: threshold={:.2f}, score={:.2f}, threads={}, max_active_paths={}, trailing_blanks={}",
               cfg.kws_threshold, cfg.kws_score, cfg.kws_num_threads,
@@ -78,7 +79,7 @@ struct ZipformerKwsEngine::Impl {
   std::optional<KwsHit> Accept(const uint8_t* pcm, size_t size_bytes, int sample_rate,
                                int channels, int bits_per_sample) {
     if (!pcm || size_bytes < 2 || bits_per_sample != 16 || channels != 1 || sample_rate <= 0) {
-      return std::nullopt;
+      return std::nullopt;  ///< 输入参数校验不通过。
     }
 
     // n 是当前 PCM 块包含的 S16 采样数。
@@ -89,19 +90,22 @@ struct ZipformerKwsEngine::Impl {
     // in 指向原始 S16 PCM 采样。
     const auto* in = reinterpret_cast<const int16_t*>(pcm);
 
+    // 将 S16 归一化到 float [-1.0, 1.0]
     samples.resize(n);
     for (size_t i = 0; i < n; ++i) {
       samples[i] = static_cast<float>(in[i]) / 32768.0f;
     }
 
+    // 将音频送入在线流
     stream.AcceptWaveform(sample_rate, samples.data(), static_cast<int32_t>(n));
 
+    // 解码并检查关键词命中
     while (spotter.IsReady(&stream)) {
       spotter.Decode(&stream);
       // r 是当前解码步的关键词检测结果。
       auto r = spotter.GetResult(&stream);
       if (!r.keyword.empty()) {
-        spotter.Reset(&stream);
+        spotter.Reset(&stream);  ///< 命中后重置流，准备下一次检测。
         KwsHit hit;
         hit.keyword = r.keyword;
         return hit;

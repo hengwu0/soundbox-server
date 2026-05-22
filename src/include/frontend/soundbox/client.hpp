@@ -72,6 +72,9 @@ class SoundBoxClient {
   // 返回当前音频模式，供 App 判断处理路径和日志定位。
   AudioMode CurrentMode() const;
 
+  // 返回最近一次连接失败的错误详情（空字符串表示无错误或连接成功）。
+  const std::string& LastConnectError() const;
+
  private:
   // 固定远端播放/录音命令超时；llm_start/llm_stop 使用配置里的独立超时。
   static constexpr int kAudioCommandTimeoutMs = 3000;
@@ -158,6 +161,8 @@ class SoundBoxClient {
   mutable std::mutex write_mu_;
   // running_ 表示客户端已启动。
   std::atomic<bool> running_{false};
+  // last_connect_error_ 存储最近一次连接失败的错误详情，用于启动时报错区分 URL/token 错误。
+  std::string last_connect_error_;
 };
 
 }  // namespace xiaoai_server::soundbox

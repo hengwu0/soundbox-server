@@ -45,6 +45,7 @@ std::vector<std::string> LoadWakeupKeywords(const std::string& keywords_file) {
   while (std::getline(in, line)) {
     ++lineno;
     line = TrimSpace(std::move(line));
+    // 跳过空行和注释行（# 或 ; 开头）
     if (line.empty() || line.front() == '#' || line.front() == ';') {
       continue;
     }
@@ -53,12 +54,12 @@ std::vector<std::string> LoadWakeupKeywords(const std::string& keywords_file) {
     const auto at = line.rfind('@');
     if (at == std::string::npos) {
       throw std::runtime_error("invalid wakeup.keywords_file line " + std::to_string(lineno) +
-                               ": missing '@' label");
+                                ": missing '@' label");
     }
     auto keyword = TrimSpace(line.substr(at + 1));
     if (keyword.empty()) {
       throw std::runtime_error("invalid wakeup.keywords_file line " + std::to_string(lineno) +
-                               ": empty keyword label");
+                                ": empty keyword label");
     }
     keywords.push_back(std::move(keyword));
   }

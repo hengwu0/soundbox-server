@@ -1,4 +1,5 @@
 #pragma once
+
 #include <atomic>
 #include <filesystem>
 #include <iostream>
@@ -34,18 +35,20 @@ class DuplicateFilterSink final : public spdlog::sinks::sink {
   // - 无。
   void log(const spdlog::details::log_msg& msg) override {
     if (!should_log(msg.level)) {
-      return;
+      return;  ///< 级别不满足，直接丢弃。
     }
 
     std::lock_guard<std::mutex> lock(mu_);
     const std::string logger_name(msg.logger_name.data(), msg.logger_name.size());
     const std::string payload(msg.payload.data(), msg.payload.size());
+    // 检查是否与上一条日志完全相同（名称、级别、正文）
     if (has_last_ && logger_name == last_logger_name_ && msg.level == last_level_ &&
         payload == last_payload_) {
-      ++repeat_count_;
+      ++repeat_count_;  ///< 累计重复次数，暂不输出。
       return;
     }
 
+    // 输出上一条日志的汇总计数（如果存在重复），再输出当前新日志
     FlushSummaryLocked();
     ForwardLocked(msg);
     has_last_ = true;
@@ -89,6 +92,7 @@ class DuplicateFilterSink final : public spdlog::sinks::sink {
       return;
     }
     std::lock_guard<std::mutex> lock(mu_);
+    // 为每个下游 sink 分发独立的 formatter（最后一个可以 move，其余 clone）
     for (size_t i = 0; i < targets_.size(); ++i) {
       if (i + 1 == targets_.size()) {
         targets_[i]->set_formatter(std::move(sink_formatter));
@@ -123,7 +127,7 @@ class DuplicateFilterSink final : public spdlog::sinks::sink {
         "previous log repeated " + std::to_string(repeat_count_) + " times";
     spdlog::details::log_msg summary_msg(last_logger_name_, last_level_, summary);
     ForwardLocked(summary_msg);
-    repeat_count_ = 0;
+    repeat_count_ = 0;  ///< 重置重复计数。
   }
 
   // targets_ 保存真正写 stdout/file 的下游 sink。
@@ -198,10 +202,14 @@ inline void ApplyLoggerSettings(const std::shared_ptr<spdlog::logger>& logger,
   if (!logger) {
     return;
   }
+  // 清空并替换 sinks
   logger->sinks().clear();
   logger->sinks().insert(logger->sinks().end(), sinks.begin(), sinks.end());
+  // 统一日志格式：[时间] [logger名] [级别] 正文
   logger->set_pattern("[%H:%M:%S.%e] [%-8n] [%^%-5l%$] %v");
+  // 从全局存储同步日志级别
   logger->set_level(static_cast<spdlog::level::level_enum>(GlobalLogLevelStorage().load()));
+  // info 及以上级别立即 flush
   logger->flush_on(spdlog::level::info);
 }
 
@@ -231,6 +239,7 @@ inline bool ConfigureLogging(bool debug_enabled,
       if (const auto parent = path.parent_path(); !parent.empty()) {
         std::filesystem::create_directories(parent);
       }
+      // 创建文件 sink，truncate=true 表示每次启动时清空旧日志
       target_sinks.push_back(
           std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.string(), true));
       file_ready = true;
@@ -245,6 +254,7 @@ inline bool ConfigureLogging(bool debug_enabled,
   {
     std::lock_guard<std::mutex> lock(GlobalLogMutex());
     GlobalLogSinks() = sinks;
+    // 对所有已注册的 logger 应用新配置
     spdlog::apply_all([&sinks](const std::shared_ptr<spdlog::logger>& logger) {
       ApplyLoggerSettings(logger, sinks);
     });
@@ -267,16 +277,18 @@ inline void SetDebugLogging(bool enabled) {
 // 返回值：
 // - 返回可直接使用的 spdlog logger 共享指针。
 inline std::shared_ptr<spdlog::logger> GetLogger(const char* name) {
+  // 优先从 spdlog 注册表查找已有 logger
   if (auto logger = spdlog::get(name)) return logger;
   try {
     std::lock_guard<std::mutex> lock(GlobalLogMutex());
     // logger 复用当前全局 sink 列表，保证后续 ConfigureLogging 能统一重配。
     auto logger = std::make_shared<spdlog::logger>(name, GlobalLogSinks().begin(),
-                                                   GlobalLogSinks().end());
+                                                    GlobalLogSinks().end());
     ApplyLoggerSettings(logger, GlobalLogSinks());
     spdlog::register_logger(logger);
     return logger;
   } catch (...) {
+    // 注册失败时尝试重新从注册表获取（可能被其他线程抢先创建）
     return spdlog::get(name);
   }
 }

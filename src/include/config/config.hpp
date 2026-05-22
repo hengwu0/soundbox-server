@@ -64,9 +64,9 @@ struct XiaozhiPreset {
 
 // 描述本地 VAD 的阈值、滑动窗口和预卷参数。
 struct VadPreset {
-  // threshold_high 是从能量概率进入“有人声”状态的高阈值。
+  // threshold_high 是从能量概率进入"有人声"状态的高阈值。
   float threshold_high{0.50f};
-  // threshold_low 是从能量概率退出“有人声”状态的低阈值。
+  // threshold_low 是从能量概率退出"有人声"状态的低阈值。
   float threshold_low{0.30f};
   // rms_floor 是 RMS 映射到概率 0 的下限，用于适配现场底噪。
   float rms_floor{120.0f};
@@ -114,6 +114,24 @@ struct Wakeup {
   int min_trigger_interval_ms{800};
 };
 
+// 描述本地播放设备（如 ALSA / PipeWire）开口时的 PCM 参数。
+struct PlaybackPreset {
+  // sample_rate 是播放设备打开的采样率，默认 24000 Hz 与 xiaozhi 下行采样率保持一致。
+  int sample_rate{24000};
+  // channels 是播放声道数，默认单声道。
+  int channels{1};
+  // bits_per_sample 是播放位深，默认 S16_LE。
+  int bits_per_sample{16};
+};
+
+// 描述本地 LLM（大语言模型）推理服务的连接参数。
+struct LlmPreset {
+  // host 是 LLM 推理服务监听的地址，默认本机回环地址。
+  std::string host{"127.0.0.1"};
+  // port 是 LLM 推理服务监听的 TCP 端口。
+  int port{7799};
+};
+
 // 描述各类内部队列与节流参数。
 struct BudgetPreset {
   // input_queue_frames 是 xiaozhi 上行 PCM 队列最多缓存的音频块数量。
@@ -154,6 +172,10 @@ struct Config {
   VadPreset vad;
   // wakeup 保存本地唤醒模型和提示语参数。
   Wakeup wakeup;
+  // playback 保存本地播放设备开口 PCM 参数。
+  PlaybackPreset playback;
+  // llm 保存本地 LLM 推理服务连接参数。
+  LlmPreset llm;
   // budget 保存内部队列和重连退避预算。
   BudgetPreset budget;
   // log 保存日志输出配置。

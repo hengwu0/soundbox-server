@@ -244,28 +244,30 @@ target_link_libraries(aec_module
 
 add_dependencies(aec_module ensure_third_party)
 
-add_library(llm_file_module
-  src/llm/file_recorder.cpp
+add_library(llm_module
+  src/llm/llm_client.cpp
 )
 
-target_include_directories(llm_file_module
+target_include_directories(llm_module
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include
 )
 
-target_link_libraries(llm_file_module
+target_link_libraries(llm_module
   PUBLIC
     common_module
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
 )
 
-target_compile_options(llm_file_module
+target_compile_options(llm_module
   PRIVATE
     -Wall
     -Wextra
     -Wpedantic
 )
 
-add_dependencies(llm_file_module ensure_third_party)
+add_dependencies(llm_module ensure_third_party)
 
 add_library(audio_processing_module
   src/config/application.cpp
@@ -280,7 +282,7 @@ target_link_libraries(audio_processing_module
   PUBLIC
     aec_module
     kws_module
-    llm_file_module
+    llm_module
     soundbox_frontend_module
 )
 
@@ -306,11 +308,38 @@ enable_testing()
 add_executable(audio_processing_module_tests
   tests/audio_processing_module_tests.cpp
   tests/aec/file_audio_stream_frontend.cpp
+  tests/aec/file_recorder.cpp
+)
+
+target_include_directories(audio_processing_module_tests
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/aec
+    ${SHERPA_ONNX_INCLUDE_DIR}
+    ${WEBRTC_APM_INCLUDE_DIRS}
+    ${WEBRTC_APM_EXTRA_INCLUDE_DIRS}
 )
 
 target_link_libraries(audio_processing_module_tests
   PRIVATE
     audio_processing_module
+    common_module
+    ixwebsocket::ixwebsocket
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ZLIB::ZLIB
+    PkgConfig::WEBRTC_APM
+    "${THIRD_PARTY_ABSL_CRC_LIB}"
+    ${SHERPA_ONNX_CXX_API_SHARED}
+    ${SHERPA_ONNX_C_API_SHARED}
+    ${ONNXRUNTIME_SHARED}
+)
+
+target_compile_options(audio_processing_module_tests
+  PRIVATE
+    ${WEBRTC_APM_CFLAGS_OTHER}
 )
 
 add_dependencies(audio_processing_module_tests ensure_third_party)
@@ -318,6 +347,12 @@ add_dependencies(audio_processing_module_tests ensure_third_party)
 add_test(NAME audio_processing_module_tests COMMAND audio_processing_module_tests)
 set_tests_properties(audio_processing_module_tests PROPERTIES
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+add_custom_target(tests
+  COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  COMMENT "Running tests via ctest"
 )
 
 add_custom_target(distclean

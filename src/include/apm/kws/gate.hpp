@@ -11,8 +11,8 @@ namespace xiaoai_server::wakeup {
 
 // 描述唤醒门控当前所处的状态。
 enum class Step {
-  kIdle,
-  kActive,
+  kIdle,    ///< 空闲态，允许接受新的唤醒触发。
+  kActive,  ///< 激活态，一次会话正在进行中。
 };
 
 // 描述门控状态切换时需要通知上层的回调。

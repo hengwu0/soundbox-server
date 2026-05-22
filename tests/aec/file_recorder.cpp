@@ -1,4 +1,4 @@
-#include "llm/file_recorder.hpp"
+#include "file_recorder.hpp"
 
 #include "common/audio_frame.hpp"
 #include "common/log.hpp"
@@ -9,13 +9,13 @@
 #include <stdexcept>
 #include <vector>
 
-namespace audio_processing_module::llm {
+namespace audio_processing_module::tests::aec {
 namespace {
 
 constexpr auto kSocketAcceptTimeout = std::chrono::seconds(10);
 constexpr auto kSocketAcceptPollTimeout = std::chrono::milliseconds(200);
 
-const auto kLog = xiaoai_server::GetLogger("llm");
+const auto kLog = xiaoai_server::GetLogger("test/aec/recorder");
 
 }  // namespace
 
@@ -24,9 +24,6 @@ FileRecorder::FileRecorder(std::string listen_socket_path, std::string output_fi
       output_file_(std::move(output_file)) {}
 
 void FileRecorder::Run() {
-  // FileRecorder is a single-client sink: only the current AEC stream should
-  // connect to this socket at a time; after disconnect we accept the next AEC
-  // stream instead of keeping a client list or broadcast path.
   stop_requested_.store(false);
   frames_written_.store(0);
   FileDescriptor server = CreateUnixServerSocket(listen_socket_path_, 1);
@@ -85,8 +82,8 @@ void FileRecorder::Stop() {
 }
 
 void FileRecorder::HandleClient(int input_fd,
-                                WavWriter* writer,
-                                uint64_t* frames_written) {
+                                 WavWriter* writer,
+                                 uint64_t* frames_written) {
   std::vector<uint8_t> output_frame(kOutputBytesPerFrame, 0);
   while (true) {
     const size_t bytes_read =
@@ -110,4 +107,4 @@ void FileRecorder::HandleClient(int input_fd,
   }
 }
 
-}  // namespace audio_processing_module::llm
+}  // namespace audio_processing_module::tests::aec

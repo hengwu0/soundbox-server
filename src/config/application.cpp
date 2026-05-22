@@ -6,7 +6,6 @@
 #include "apm/aec/webrtc_processor.hpp"
 #include "common/log.hpp"
 #include "frontend/soundbox_frontend.hpp"
-#include "llm/file_recorder.hpp"
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -31,44 +30,57 @@
 namespace audio_processing_module {
 namespace {
 
+/// CLI 命令行选项，从 main() 解析后传入配置加载流程。
 struct CliOptions {
-  std::string input_file;
-  std::string output_file;
-  std::string config_path;
+  std::string config_path;  ///< 用户通过 --config 指定的 YAML 配置文件路径。
 };
 
+/// 进程级关闭信号标志，由信号处理器写入，主循环轮询读取。
 volatile std::sig_atomic_t g_shutdown_signal = 0;
 
+/// 信号处理器回调：将收到的信号编号写入全局标志。
+/// @param signal_number 操作系统传入的信号编号（SIGINT 或 SIGTERM）。
 void HandleShutdownSignal(int signal_number) {
   g_shutdown_signal = signal_number;
 }
 
+/// 判断是否收到了关闭信号。
+/// @return 收到关闭信号时返回 true。
 bool ShutdownSignalRequested() {
   return g_shutdown_signal != 0;
 }
 
+/// RAII 守卫：构造时注册 SIGINT/SIGTERM 处理器，析构时恢复原处理器。
 class SignalHandlerGuard {
  public:
+  /// 构造守卫：保存原有信号处理器并注册新的处理函数。
   SignalHandlerGuard()
       : previous_sigint_(std::signal(SIGINT, HandleShutdownSignal)),
         previous_sigterm_(std::signal(SIGTERM, HandleShutdownSignal)) {
-    g_shutdown_signal = 0;
+    g_shutdown_signal = 0;  ///< 重置关闭信号标志，确保干净启动。
   }
 
+  /// 析构守卫：恢复原始信号处理器。
   ~SignalHandlerGuard() {
     std::signal(SIGINT, previous_sigint_);
     std::signal(SIGTERM, previous_sigterm_);
   }
 
+  /// 禁止拷贝，保证 RAII 语义不被意外破坏。
   SignalHandlerGuard(const SignalHandlerGuard&) = delete;
   SignalHandlerGuard& operator=(const SignalHandlerGuard&) = delete;
 
  private:
   using Handler = void (*)(int);
-  Handler previous_sigint_{SIG_DFL};
-  Handler previous_sigterm_{SIG_DFL};
+  Handler previous_sigint_{SIG_DFL};   ///< 启动前原始的 SIGINT 处理器。
+  Handler previous_sigterm_{SIG_DFL};  ///< 启动前原始的 SIGTERM 处理器。
 };
 
+/// 从命令行参数列表中取出下一个参数作为选项值。
+/// @param args  命令行参数列表。
+/// @param index 当前参数索引，调用后会自增指向值。
+/// @return 选项对应的字符串值。
+/// @throws std::runtime_error 如果当前选项后没有值。
 std::string RequireValue(const std::vector<std::string>& args, size_t& index) {
   if (index + 1 >= args.size()) {
     throw std::runtime_error("missing value for option: " + args[index]);
@@ -77,6 +89,11 @@ std::string RequireValue(const std::vector<std::string>& args, size_t& index) {
   return args[index];
 }
 
+/// 将字符串解析为整数，若格式非法则抛出异常。
+/// @param value       待解析的字符串。
+/// @param option_name 选项名（用于错误提示）。
+/// @return 解析后的整数。
+/// @throws std::runtime_error 格式非法时抛出。
 int ParseInt(const std::string& value, const std::string& option_name) {
   try {
     size_t parsed = 0;
@@ -90,6 +107,11 @@ int ParseInt(const std::string& value, const std::string& option_name) {
   }
 }
 
+/// 将字符串解析为浮点数，若格式非法则抛出异常。
+/// @param value       待解析的字符串。
+/// @param option_name 选项名（用于错误提示）。
+/// @return 解析后的浮点数。
+/// @throws std::runtime_error 格式非法时抛出。
 float ParseFloat(const std::string& value, const std::string& option_name) {
   try {
     size_t parsed = 0;
@@ -103,6 +125,11 @@ float ParseFloat(const std::string& value, const std::string& option_name) {
   }
 }
 
+/// 将字符串 "true"/"false" 解析为布尔值。
+/// @param value       待解析的字符串。
+/// @param option_name 选项名（用于错误提示）。
+/// @return 解析后的布尔值。
+/// @throws std::runtime_error 格式非法时抛出。
 bool ParseBool(const std::string& value, const std::string& option_name) {
   if (value == "true") {
     return true;
@@ -113,6 +140,10 @@ bool ParseBool(const std::string& value, const std::string& option_name) {
   throw std::runtime_error("invalid bool for " + option_name + ": " + value);
 }
 
+/// 将噪声抑制级别字符串转换为枚举值。
+/// @param value 噪声抑制级别字符串（"low" / "moderate" / "high" / "very-high"）。
+/// @return 对应的枚举值。
+/// @throws std::runtime_error 未知级别时抛出。
 WebRtcProcessorOptions::NoiseSuppressionLevel ParseNoiseSuppressionLevel(
     const std::string& value) {
   if (value == "low") {
@@ -130,6 +161,9 @@ WebRtcProcessorOptions::NoiseSuppressionLevel ParseNoiseSuppressionLevel(
   throw std::runtime_error("invalid ns_level: " + value);
 }
 
+/// 将噪声抑制级别枚举值转换为 YAML 可显示的字符串。
+/// @param level 噪声抑制级别枚举值。
+/// @return 对应的字符串表示。
 std::string FormatNoiseSuppressionLevel(
     WebRtcProcessorOptions::NoiseSuppressionLevel level) {
   switch (level) {
@@ -145,6 +179,10 @@ std::string FormatNoiseSuppressionLevel(
   throw std::runtime_error("unknown noise suppression level");
 }
 
+/// 将 AGC 模式字符串转换为枚举值。
+/// @param value AGC 模式字符串（"adaptive-digital" / "fixed-digital"）。
+/// @return 对应的枚举值。
+/// @throws std::runtime_error 未知模式时抛出。
 WebRtcProcessorOptions::AgcMode ParseAgcMode(const std::string& value) {
   if (value == "adaptive-digital") {
     return WebRtcProcessorOptions::AgcMode::kAdaptiveDigital;
@@ -155,6 +193,9 @@ WebRtcProcessorOptions::AgcMode ParseAgcMode(const std::string& value) {
   throw std::runtime_error("invalid agc_mode: " + value);
 }
 
+/// 将 AGC 模式枚举值转换为 YAML 可显示的字符串。
+/// @param mode AGC 模式枚举值。
+/// @return 对应的字符串表示。
 std::string FormatAgcMode(WebRtcProcessorOptions::AgcMode mode) {
   switch (mode) {
     case WebRtcProcessorOptions::AgcMode::kAdaptiveDigital:
@@ -165,19 +206,27 @@ std::string FormatAgcMode(WebRtcProcessorOptions::AgcMode mode) {
   throw std::runtime_error("unknown agc mode");
 }
 
+/// 生成默认的 Unix Domain Socket 目录路径，以进程 PID 区分多实例。
+/// @return 格式为 "/tmp/audio_processing_module_<pid>" 的路径。
 std::string DefaultSocketDir() {
   return "/tmp/audio_processing_module_" + std::to_string(static_cast<long>(::getpid()));
 }
 
+/// 判断命令行参数是否属于已迁移到 YAML 配置的废弃选项。
+/// @param arg 命令行参数。
+/// @return 如果是已废弃的选项则返回 true。
 bool IsRemovedConfigOption(const std::string& arg) {
   return arg == "--socket-dir" || arg == "--delay-ms" ||
          arg == "--pre-aec-auto-gain-target-rms" ||
          arg == "--pre-aec-auto-gain-max" ||
          arg == "--disable-pre-aec-auto-gain" || arg == "--ns-level" ||
          arg == "--agc-mode" || arg == "--agc-target-dbfs" ||
-         arg == "--agc-compression-gain-db";
+         arg == "--agc-compression-gain-db" || arg == "--input" || arg == "-i";
 }
 
+/// 去除字符串首尾空白字符。
+/// @param value 原始字符串。
+/// @return 去掉首尾空白后的新字符串。
 std::string Trim(const std::string& value) {
   const auto is_not_space = [](unsigned char character) {
     return !std::isspace(character);
@@ -190,9 +239,12 @@ std::string Trim(const std::string& value) {
   return std::string(begin, end);
 }
 
+/// 去掉 YAML 行中的内联注释（# 及其之后的内容），但保留引号内的 #。
+/// @param value 原始行内容。
+/// @return 去掉注释后的内容。
 std::string StripInlineComment(const std::string& value) {
-  bool in_single_quote = false;
-  bool in_double_quote = false;
+  bool in_single_quote = false;   ///< 是否正在单引号内。
+  bool in_double_quote = false;   ///< 是否正在双引号内。
 
   for (size_t index = 0; index < value.size(); ++index) {
     const char character = value[index];
@@ -201,6 +253,7 @@ std::string StripInlineComment(const std::string& value) {
     } else if (character == '"' && !in_single_quote) {
       in_double_quote = !in_double_quote;
     } else if (character == '#' && !in_single_quote && !in_double_quote) {
+      // 在引号外遇到 #，截断为注释
       return value.substr(0, index);
     }
   }
@@ -208,6 +261,9 @@ std::string StripInlineComment(const std::string& value) {
   return value;
 }
 
+/// 去掉 YAML 值两端的引号（单引号或双引号）。
+/// @param value 原始值字符串。
+/// @return 去掉引号（如果有）后的值。
 std::string Unquote(const std::string& value) {
   if (value.size() >= 2 &&
       ((value.front() == '"' && value.back() == '"') ||
@@ -217,6 +273,10 @@ std::string Unquote(const std::string& value) {
   return value;
 }
 
+/// 根据 CLI 传入路径解析最终配置文件路径。
+/// 空路径时默认返回当前目录下的 apm.yaml；传入目录则在目录内查找 apm.yaml。
+/// @param cli_config_path 命令行传入的配置路径（可为空、目录或文件路径）。
+/// @return 最终确定的配置文件路径。
 std::filesystem::path ResolveConfigFilePath(const std::string& cli_config_path) {
   if (cli_config_path.empty()) {
     return std::filesystem::current_path() / "apm.yaml";
@@ -232,6 +292,9 @@ std::filesystem::path ResolveConfigFilePath(const std::string& cli_config_path) 
   return path;
 }
 
+/// 当配置文件不存在时，用当前默认值写入一份默认 apm.yaml。
+/// @param config_file 目标文件路径。
+/// @param defaults    当前默认流水线选项。
 void WriteDefaultConfig(const std::filesystem::path& config_file,
                         const PipelineOptions& defaults) {
   const std::filesystem::path parent = config_file.parent_path();
@@ -273,9 +336,12 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
          << "  min_trigger_interval_ms: "
          << defaults.runtime.wakeup.min_trigger_interval_ms << "\n"
          << "playback:\n"
-         << "  sample_rate: " << defaults.runtime.xiaozhi.downlink_sample_rate << "\n"
-         << "  channels: 1\n"
-         << "  bits_per_sample: 16\n"
+         << "  sample_rate: " << defaults.runtime.playback.sample_rate << "\n"
+         << "  channels: " << defaults.runtime.playback.channels << "\n"
+         << "  bits_per_sample: " << defaults.runtime.playback.bits_per_sample << "\n"
+         << "llm:\n"
+         << "  host: \"" << defaults.runtime.llm.host << "\"\n"
+         << "  port: " << defaults.runtime.llm.port << "\n"
          << "aec:\n"
          << "  delay_ms: " << processor.delay_ms << "\n"
          << "  pre_aec_auto_gain:\n"
@@ -310,6 +376,11 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
   }
 }
 
+/// 解析 YAML 中的单个键值对，应用到 PipelineOptions 的对应字段。
+/// @param options 输出参数，当前流水线配置。
+/// @param key     YAML 键（可能带层级前缀，如 "aec.pre_aec_auto_gain.enabled"）。
+/// @param value   YAML 值（已去掉引号和注释）。
+/// @throws std::runtime_error 未知键或值格式非法时抛出。
 void ApplyConfigEntry(PipelineOptions* options,
                       const std::string& key,
                       const std::string& value) {
@@ -318,8 +389,6 @@ void ApplyConfigEntry(PipelineOptions* options,
 
   if (key == "socket_dir") {
     options->socket_dir = value;
-  } else if (key == "output_file") {
-    options->output_file = value;
   } else if (key == "soundbox.ws_url") {
     options->runtime.soundbox.ws_url = value;
   } else if (key == "soundbox.ws_token") {
@@ -355,9 +424,15 @@ void ApplyConfigEntry(PipelineOptions* options,
   } else if (key == "wakeup.min_trigger_interval_ms") {
     options->runtime.wakeup.min_trigger_interval_ms = ParseInt(value, key);
   } else if (key == "playback.sample_rate") {
-    options->runtime.xiaozhi.downlink_sample_rate = ParseInt(value, key);
-  } else if (key == "playback.channels" || key == "playback.bits_per_sample") {
-    (void)ParseInt(value, key);
+    options->runtime.playback.sample_rate = ParseInt(value, key);
+  } else if (key == "playback.channels") {
+    options->runtime.playback.channels = ParseInt(value, key);
+  } else if (key == "playback.bits_per_sample") {
+    options->runtime.playback.bits_per_sample = ParseInt(value, key);
+  } else if (key == "llm.host") {
+    options->runtime.llm.host = value;
+  } else if (key == "llm.port") {
+    options->runtime.llm.port = ParseInt(value, key);
   } else if (key == "audio.playback_gain") {
     options->runtime.audio.playback_gain = ParseFloat(value, key);
   } else if (key == "delay_ms" || key == "aec.delay_ms") {
@@ -409,6 +484,10 @@ void ApplyConfigEntry(PipelineOptions* options,
   }
 }
 
+/// 读取 YAML 配置文件，逐行解析并应用到 PipelineOptions。
+/// 支持无缩进的顶层键作为 section，2 空格缩进为 subsection，4 空格缩进为深层键。
+/// @param config_file 配置文件路径。
+/// @param options     输出参数，用于填充配置值。
 void LoadConfigFile(const std::filesystem::path& config_file,
                     PipelineOptions* options) {
   std::ifstream input(config_file);
@@ -417,8 +496,8 @@ void LoadConfigFile(const std::filesystem::path& config_file,
   }
 
   std::string line;
-  std::string section;
-  std::string subsection;
+  std::string section;     ///< 当前顶层 section（如 "aec"）。
+  std::string subsection;  ///< 当前子 section（如 "pre_aec_auto_gain"）。
   size_t line_number = 0;
   while (std::getline(input, line)) {
     ++line_number;
@@ -429,6 +508,7 @@ void LoadConfigFile(const std::filesystem::path& config_file,
       continue;
     }
 
+    // 查找冒号分隔的键值对
     const size_t separator = content.find(':');
     if (separator == std::string::npos) {
       throw std::runtime_error("invalid config line " +
@@ -444,6 +524,7 @@ void LoadConfigFile(const std::filesystem::path& config_file,
                                std::to_string(line_number) + ": " + content);
     }
     if (raw_value.empty()) {
+      // 空值表示这是一个 section 声明行
       if (!indented) {
         section = raw_key;
         subsection.clear();
@@ -457,6 +538,7 @@ void LoadConfigFile(const std::filesystem::path& config_file,
       continue;
     }
 
+    // 构建完整的层级键名（e.g. aec.pre_aec_auto_gain.enabled）
     std::string key = raw_key;
     if (indented) {
       if (section.empty()) {
@@ -477,26 +559,26 @@ void LoadConfigFile(const std::filesystem::path& config_file,
   }
 }
 
+/// 返回一套携带默认值的 PipelineOptions。
+/// @return 默认配置好的流水线选项。
 PipelineOptions DefaultPipelineOptions() {
   PipelineOptions options;
-  options.output_file = "output/aec_processed.wav";
   options.socket_dir = DefaultSocketDir();
   options.runtime.soundbox.ws_url.clear();
-  options.runtime.soundbox.ws_token.clear();
   options.runtime.log.file_path = "logs/soundbox_server.log";
   return options;
 }
 
+/// 解析命令行参数，返回 CLI 选项结构体。
+/// @param args 命令行参数列表（含 argv[0]）。
+/// @return CLI 解析结果。
+/// @throws std::runtime_error 参数非法或请求帮助时抛出。
 CliOptions ParseCliOptions(const std::vector<std::string>& args) {
   CliOptions options;
 
   for (size_t index = 1; index < args.size(); ++index) {
     const std::string& arg = args[index];
-    if (arg == "--input" || arg == "-i") {
-      options.input_file = RequireValue(args, index);
-    } else if (arg == "--output" || arg == "-o") {
-      options.output_file = RequireValue(args, index);
-    } else if (arg == "--config" || arg == "-c") {
+    if (arg == "--config" || arg == "-c") {
       options.config_path = RequireValue(args, index);
     } else if (IsRemovedConfigOption(arg)) {
       throw std::runtime_error(arg + " has moved to apm.yaml; use --config <path-or-dir>");
@@ -510,8 +592,31 @@ CliOptions ParseCliOptions(const std::vector<std::string>& args) {
   return options;
 }
 
+/// 清理 socket 目录下的旧 socket 文件，防止 bind 失败。
+/// @param socket_dir socket 文件所在目录。
+void CleanupStaleSocketFiles(const std::filesystem::path& socket_dir) {
+  const std::vector<std::string> socket_names = {
+      "frontend_kws.sock",       ///< KWS 唤醒词前端通信 socket。
+      "frontend_aec.sock",       ///< AEC 回声消除前端通信 socket。
+      "aec_llm.sock",            ///< AEC 到 LLM 音频转发 socket。
+      "frontend_playback.sock",  ///< 前端播放音频 socket。
+  };
+  for (const auto& name : socket_names) {
+    const std::filesystem::path path = socket_dir / name;
+    if (std::filesystem::exists(path)) {
+      std::filesystem::remove(path);
+      const auto log = xiaoai_server::GetLogger("main");
+      log->info("cleaned stale socket file {}", path.string());
+    }
+  }
+}
+
 }  // namespace
 
+/// 解析命令行参数并加载 YAML 配置，返回最终流水线选项。
+/// 如果配置文件不存在，会先生成一份默认配置。
+/// @param args 命令行参数列表。
+/// @return 合并后的 PipelineOptions。
 PipelineOptions ParseOptions(const std::vector<std::string>& args) {
   const CliOptions cli_options = ParseCliOptions(args);
   PipelineOptions options = DefaultPipelineOptions();
@@ -523,36 +628,35 @@ PipelineOptions ParseOptions(const std::vector<std::string>& args) {
   }
   LoadConfigFile(config_file, &options);
 
-  if (!cli_options.output_file.empty()) {
-    options.output_file = cli_options.output_file;
-  }
-  if (!cli_options.input_file.empty()) {
-    options.input_file = cli_options.input_file;
-  }
-
   return options;
 }
 
+/// 返回命令行使用说明字符串。
+/// @param program_name 程序名（通常为 argv[0]）。
+/// @return 使用说明文本。
 std::string Usage(const std::string& program_name) {
   std::ostringstream output;
   output << "Usage: " << program_name
-         << " [--output <processed.wav>]"
          << " [--config <apm.yaml|config-dir>]\n";
   return output.str();
 }
 
+/// 监管多条工作线程，任一异常或停止信号时通知全部线程退出。
+/// @param workers     需要同时运行的 Worker 列表。
+/// @param should_stop 外部停止条件回调，返回 true 时请求全体退出。
 void RunSupervisedWorkers(const std::vector<SupervisedWorker>& workers,
-                          const std::function<bool()>& should_stop) {
+                           const std::function<bool()>& should_stop) {
   if (workers.empty()) {
     return;
   }
 
   std::mutex mutex;
   std::condition_variable cv;
-  std::exception_ptr first_error;
-  std::atomic<bool> stop_requested{false};
-  size_t completed = 0;
+  std::exception_ptr first_error;  ///< 首个被捕获的工作线程异常。
+  std::atomic<bool> stop_requested{false};  ///< 向所有线程发出停止请求的标记。
+  size_t completed = 0;  ///< 已完成的工作线程计数。
 
+  /// 将首次错误记录下来并通知所有线程停止。
   auto record_error = [&](std::exception_ptr error) {
     {
       std::lock_guard<std::mutex> lock(mutex);
@@ -570,6 +674,7 @@ void RunSupervisedWorkers(const std::vector<SupervisedWorker>& workers,
     threads.emplace_back([&, index] {
       try {
         workers[index].run();
+        // worker 正常返回视为异常退出
         if (!stop_requested.load()) {
           record_error(std::make_exception_ptr(
               std::runtime_error("worker exited unexpectedly: " +
@@ -589,10 +694,12 @@ void RunSupervisedWorkers(const std::vector<SupervisedWorker>& workers,
 
   {
     std::unique_lock<std::mutex> lock(mutex);
+    // 短暂等待后检查是否有 worker 已失败
     cv.wait_for(lock, std::chrono::milliseconds(200), [&] {
       return first_error || completed == workers.size() ||
              (should_stop && should_stop());
     });
+    // 持续监听直到满足退出条件
     while (!first_error && completed != workers.size() &&
            !(should_stop && should_stop())) {
       cv.wait_for(lock, std::chrono::milliseconds(200));
@@ -602,29 +709,39 @@ void RunSupervisedWorkers(const std::vector<SupervisedWorker>& workers,
     }
   }
 
+  // 逆序调用 stop() 对外通知各子模块停止
   if (stop_requested.load()) {
     for (auto it = workers.rbegin(); it != workers.rend(); ++it) {
       if (it->stop) {
         try {
           it->stop();
         } catch (...) {
+          // 忽略 stop 过程中的异常
         }
       }
     }
   }
 
+  // 等待所有线程结束
   for (std::thread& thread : threads) {
     if (thread.joinable()) {
       thread.join();
     }
   }
 
+  // 有异常则重新抛出第一个异常
   if (first_error) {
     std::rethrow_exception(first_error);
   }
 }
 
+/// 根据 PipelineOptions 启动整个音频处理流水线。
+/// 初始化日志、验证配置、创建各子模块并监管运行。
+/// @param options 已解析的流水线配置。
+/// @return 正常退出返回 0。
+/// @throws std::runtime_error 关键配置缺失或资源文件不存在时抛出。
 int RunPipeline(const PipelineOptions& options) {
+  // 初始化日志系统
   const bool file_log_ready = xiaoai_server::ConfigureLogging(
       options.runtime.log.enable_debug, options.runtime.log.file_enabled,
       options.runtime.log.file_path);
@@ -633,11 +750,16 @@ int RunPipeline(const PipelineOptions& options) {
             options.runtime.log.enable_debug, options.runtime.log.file_enabled,
             file_log_ready, options.runtime.log.file_path);
 
+  // 验证必要配置项
   if (options.runtime.soundbox.ws_url.empty()) {
-    throw std::runtime_error("missing required config: soundbox.ws_url");
+    throw std::runtime_error("missing or invalid config: soundbox.ws_url is empty");
+  }
+  if (options.runtime.soundbox.ws_url.find("ws://") != 0 &&
+      options.runtime.soundbox.ws_url.find("wss://") != 0) {
+    throw std::runtime_error("invalid config: soundbox.ws_url must start with ws:// or wss://");
   }
   if (options.runtime.soundbox.ws_token.empty()) {
-    throw std::runtime_error("missing required config: soundbox.ws_token");
+    throw std::runtime_error("missing or invalid config: soundbox.ws_token is empty");
   }
   const std::vector<std::string> required_kws_files = {
       options.runtime.wakeup.keywords_file,
@@ -652,37 +774,57 @@ int RunPipeline(const PipelineOptions& options) {
     }
   }
 
+  // 创建 socket 目录并清理残留文件
   std::filesystem::create_directories(options.socket_dir);
+  CleanupStaleSocketFiles(options.socket_dir);
+
+  // 拼接各子模块的 Unix Socket 路径
   const std::string frontend_kws_socket =
       (std::filesystem::path(options.socket_dir) / "frontend_kws.sock").string();
   const std::string frontend_aec_socket =
       (std::filesystem::path(options.socket_dir) / "frontend_aec.sock").string();
-  const std::string aec_llm_socket =
-      (std::filesystem::path(options.socket_dir) / "aec_llm.sock").string();
   const std::string frontend_playback_socket =
       (std::filesystem::path(options.socket_dir) / "frontend_playback.sock").string();
 
-  llm::FileRecorder llm(aec_llm_socket, options.output_file);
-  apm::aec::AecStreamProcessor aec(frontend_aec_socket, aec_llm_socket,
-                                   options.processor);
+  // 创建 LLM 客户端并连接
+  auto llm_client = std::make_shared<soundbox_server::llm::LlmClient>(
+      soundbox_server::llm::LlmClientOptions{
+          options.runtime.llm.host,
+          options.runtime.llm.port,
+      },
+      [](const std::string&) {});
+  llm_client->Connect();
+
+  // AEC 处理后的音频通过该回调送入 LLM
+  auto aec_audio_sink = [llm_client](const std::vector<uint8_t>& processed_pcm) {
+    llm_client->SendAudio(processed_pcm);
+  };
+
+  // 创建 AEC 处理流
+  apm::aec::AecStreamProcessor aec(frontend_aec_socket, aec_audio_sink,
+                                     options.processor);
+  // 创建 KWS 引擎
   auto kws_engine =
       std::make_shared<xiaoai_server::wakeup::ZipformerKwsEngine>(
           options.runtime.wakeup);
+  // 创建 KWS Socket 服务器
   apm::kws::KwsSocketServer::Options kws_options;
   kws_options.listen_socket_path = frontend_kws_socket;
   apm::kws::KwsSocketServer kws(kws_options, kws_engine);
 
+  // 创建 Frontend（前端音频采集/播放模块）
   soundbox_server::frontend::Frontend::Options frontend_options;
   frontend_options.kws_socket_path = frontend_kws_socket;
   frontend_options.aec_socket_path = frontend_aec_socket;
   frontend_options.playback_socket_path = frontend_playback_socket;
   frontend_options.soundbox_config = options.runtime;
+  frontend_options.llm_client = llm_client;
   soundbox_server::frontend::Frontend frontend(frontend_options);
 
+  // 注册信号处理器并监管运行 aec / kws / frontend 三条工作线程
   SignalHandlerGuard signal_handler_guard;
   RunSupervisedWorkers(
       {
-          SupervisedWorker{"llm", [&] { llm.Run(); }, [&] { llm.Stop(); }},
           SupervisedWorker{"aec", [&] { aec.Run(); }, [&] { aec.Stop(); }},
           SupervisedWorker{"kws", [&] { kws.Run(); }, [&] { kws.Stop(); }},
           SupervisedWorker{"frontend", [&] { frontend.Run(); },
