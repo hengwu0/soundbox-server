@@ -40,26 +40,25 @@ struct ControlMessage {
 ControlMessage ParseControlMessageLine(const std::string& line,
                                         ControlMessageType expected_type);
 
-// Frontend 主控类，管理唤醒词检测 → LLM 会话 → AEC 音频处理的完整生命周期。
+// Frontend 主控类，管理初始化 → 空闲 → 会话启动 → 会话进行 → 会话停止的完整生命周期。
 //
 // 状态机流程：
-//   kSessionEnd（默认空闲，无活跃会话）
-//     → kKws（启动唤醒词检测，等待 KWS 命中）
-//     → kLlmStarting（收到 session_start，通知下游启动 LLM）
-//     → kAec（LLM 已启动，正在进行回声消除和音频转发）
-//     → kLlmStopping（收到 session_end，通知下游停止 LLM）
-//     → kSessionEnd（回到空闲状态，等待下一次唤醒）
-//   kFault 为终端故障状态，任何环节遇到不可恢复错误时可进入。
+//   kSessionInit（初始/重连状态：准备建立 WebSocket 音频链路）
+//     → kSessionStopped（空闲状态：WebSocket 链路就绪，等待唤醒）
+//     → kSessionStarting（会话启动中：KWS 命中，正在通知 SoundBox 启用 LLM 通道）
+//     → kSessionStarted（会话进行中：LLM 已启动，正在进行 AEC 和音频转发）
+//     → kSessionStopping（会话停止中：收到 session_stop，正在通知 SoundBox 关闭 LLM 通道）
+//     → kSessionStopped（回到空闲状态，等待下一次唤醒）
+//   任意状态遇到 AEC/KWS socket 断开或 WS 断开时回到 kSessionInit，重连 ws 音频链路。
 class Frontend {
  public:
   // 前端运行状态枚举
   enum class State {
-    kSessionEnd,    // 默认空闲状态：无活跃的 LLM/AEC 会话，等待唤醒
-    kKws,           // 唤醒词检测状态：正在监听 KWS 音频流，等待唤醒词命中
-    kLlmStarting,   // LLM 启动中：已收到 session_start，正在通知 SoundBox 启用 LLM 通道
-    kAec,           // AEC 音频处理中：LLM 已启动，正在进行回声消除并转发音频到 LLM
-    kLlmStopping,   // LLM 停止中：收到 session_end，正在通知 SoundBox 关闭 LLM 通道
-    kFault,         // 故障终端状态：遇到不可恢复错误，前端需停止并退出
+    kSessionInit,     // 初始/重连状态：准备建立 WebSocket 音频链路，所有音频丢弃
+    kSessionStopped,      // 空闲状态：WebSocket 链路就绪，等待唤醒
+    kSessionStarting, // 会话启动中：KWS 命中后正在通知 SoundBox 启用 LLM 通道
+    kSessionStarted,  // 会话进行中：LLM 通道已启用，AEC 处理并转发音频到 LLM
+    kSessionStopping, // 会话停止中：收到 session_stop 后正在通知 SoundBox 关闭 LLM 通道
   };
 
   // 前端初始化选项
@@ -91,18 +90,18 @@ class Frontend {
  private:
   // 唤醒音频回调：将 KWS 音频数据写入 KWS socket 供唤醒词引擎处理
   // chunk：音频数据块（PCM 格式）
-  // 仅在 kKws 状态下写入，其他状态丢弃该音频块
+  // 仅在 kSessionStopped 状态下写入，其他状态丢弃该音频块
   void OnWakeupAudio(const std::vector<uint8_t>& chunk);
   // AEC 音频回调：将话筒/喇叭音频数据写入 AEC socket 供回声消除引擎处理
   // chunk：音频数据块（PCM 格式）
-  // 仅在 kAec 状态下写入，其他状态丢弃该音频块
+  // 仅在 kSessionStarted 状态下写入，其他状态丢弃该音频块
   void OnAecAudio(const std::vector<uint8_t>& chunk);
   // AEC 处理后音频回调：将回声消除后的 PCM 数据发送给 LLM 客户端
   // processed_pcm：回声消除处理后的音频数据
   void OnAecProcessedAudio(const std::vector<uint8_t>& processed_pcm);
   // LLM 会话结束回调：由 LLM 客户端在会话结束时调用（如 VAD 静音超时）
   // reason：会话结束原因字符串，由 LLM 客户端提供
-  // 转发给 HandleSessionEnd 执行状态转换逻辑
+  // 转发给 HandleSessionStop 执行状态转换逻辑
   void OnLlmSessionEnd(const std::string& reason);
   // KWS 控制通道读取线程：循环读取 session_start 消息并分发给 HandleSessionStart
   void KwsControlReaderLoop();
@@ -111,24 +110,26 @@ class Frontend {
   // 播放客户端处理循环：从客户端 fd 读取 PCM 数据并写入 SoundBox 播放队列
   // client_fd：已接受的播放客户端 socket 文件描述符
   void PlaybackClientLoop(int client_fd);
-  // 处理 session_start 消息：仅在 kKws 状态下有效
+  // 处理 session_start 消息：仅在 kSessionStopped 状态下有效
   // message：已解析的 session_start 控制消息
-  // 成功后进入 kLlmStarting → kAec，失败则回到 kKws 继续等待唤醒
+  // 成功后进入 kSessionStarting → kSessionStarted，失败则回到 kSessionStopped 继续等待唤醒
   void HandleSessionStart(const ControlMessage& message);
-  // 处理 session_end 消息：仅在 kAec 状态下有效，其他状态输出警告并忽略
+  // 处理 session_stop 消息：仅在 kSessionStarted 状态下有效，其他状态输出警告并忽略
   // reason：session 结束原因字符串
-  // 进入 kLlmStopping，通知下游停止 LLM，最终回到 kSessionEnd 空闲状态
-  void HandleSessionEnd(const std::string& reason);
-  // 进入故障状态并停止所有组件：设置 kFault 状态、关闭所有 socket、
-  // 断开 LLM 和 SoundBox 客户端、通知条件变量唤醒主线程
-  // reason：故障原因描述
-  void EnterFaultAndStop(const char* reason);
+  // 进入 kSessionStopping，通知下游停止 LLM，最终回到 kSessionStopped 空闲状态
+  void HandleSessionStop(const std::string& reason);
+  // 进入初始重连状态：设置 kSessionInit 状态、断开当前链路、
+  // 尝试重连 WebSocket 音频链路。重连成功后回到 kSessionStopped 空闲状态。
+  // reason：断连原因描述，用于日志诊断
+  void EnterSessionInitAndRestart(const char* reason);
   // 线程安全地设置状态并记录日志，相同状态不重复设置
   // next：目标状态
   // reason：状态变更原因描述
   void SetState(State next, const char* reason);
   // 检查是否已收到停止请求（无锁读取原子变量）
   bool IsStopping() const;
+  // 重连 WebSocket 音频链路：重新启动 SoundBox 客户端并恢复远端音频
+  bool RestartSoundboxAudioLink();
 
   Options options_;  // 前端配置选项副本
   std::unique_ptr<xiaoai_server::soundbox::SoundBoxClient> client_;  // SoundBox 客户端实例
@@ -139,7 +140,7 @@ class Frontend {
   std::thread playback_thread_;      // 播放接受线程
   mutable std::mutex mu_;            // 保护 state_ 和条件变量的互斥锁
   std::condition_variable stop_cv_;  // 停止条件变量，用于阻塞 Run() 主循环等待停止信号
-  State state_{State::kSessionEnd};  // 当前运行状态，默认为 kSessionEnd 空闲状态
+  State state_{State::kSessionInit};  // 当前运行状态，默认为 kSessionInit 初始/重连状态
   std::atomic<bool> stop_requested_{false};  // 停止请求标志，原子变量保证多线程可见性
 };
 

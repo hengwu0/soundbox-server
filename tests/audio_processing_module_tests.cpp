@@ -827,7 +827,7 @@ static void TestFrontendControlMessageParserRequiresTypedJsonFields() {
 }
 
 // 测试前端控制 socket 连接断开时系统进入 Fault 状态。
-static void TestFrontendControlSocketDisconnectsEnterFault() {
+static void TestFrontendControlSocketDisconnectsReconnect() {
   const std::filesystem::path temp_root = MakeTempDirectory("frontend_control_fault");
   const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
   const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
@@ -903,11 +903,11 @@ static void TestFrontendControlSocketDisconnectsEnterFault() {
                       std::chrono::seconds(5)),
             "frontend should finish soundbox startup");
     trigger_fault.store(true);
-    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kFault; },
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionInit; },
                       std::chrono::seconds(2)),
-            "KWS control socket disconnect should put frontend into Fault");
-    Require(WaitUntil([&] { return frontend_returned.load(); }, std::chrono::seconds(2)),
-            "frontend should stop after KWS control socket fault");
+            "KWS control socket disconnect should put frontend into SessionInit");
+    Require(WaitUntil([&] { return frontend_returned.load(); }, std::chrono::seconds(15)),
+            "frontend should stop after reconnect fails");
   } catch (...) {
     frontend.Stop();
     stop_servers.store(true);
@@ -1113,9 +1113,9 @@ static void TestFrontendMockSoundboxSmokeLoop() {
     Require(WaitUntil([&] { return mock_soundbox.SawCommand("fast_recording"); },
                       std::chrono::seconds(5)),
             "frontend should send fast_recording after start_play");
-    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kKws; },
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStopped; },
                       std::chrono::seconds(5)),
-            "frontend should enter KWS mode after remote audio starts");
+            "frontend should enter SessionEnd state after remote audio starts");
 
     mock_soundbox.SendRecord("kws-record", std::vector<uint8_t>(320, 0x11));
     Require(WaitUntil([&] { return kws_bytes.load() >= 320; }, std::chrono::seconds(5)),
@@ -1123,9 +1123,9 @@ static void TestFrontendMockSoundboxSmokeLoop() {
     Require(WaitUntil([&] { return mock_soundbox.SawCommand("llm_start"); },
                       std::chrono::seconds(5)),
             "session_start should trigger llm_start");
-    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kAec; },
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStarted; },
                       std::chrono::seconds(5)),
-            "llm_start_ok should switch frontend into AEC mode");
+            "llm_start_ok should switch frontend into SessionStarted state");
 
     mock_soundbox.SendRecord("aec-record", std::vector<uint8_t>(640, 0x22));
     Require(WaitUntil([&] { return aec_bytes.load() >= 640; }, std::chrono::seconds(5)),
@@ -1135,9 +1135,10 @@ static void TestFrontendMockSoundboxSmokeLoop() {
     Require(WaitUntil([&] { return mock_soundbox.SawCommand("llm_stop"); },
                       std::chrono::seconds(5)),
             "session_end should trigger llm_stop");
-    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kKws; },
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStopped ||
+                            frontend.state() == Frontend::State::kSessionInit; },
                       std::chrono::seconds(5)),
-            "llm_stop_ok should return frontend to KWS mode");
+            "llm_stop_ok should return frontend to SessionEnd or reconnect");
 
     auto playback_client = audio_processing_module::ConnectUnixSocketWithRetry(
         playback_socket, std::chrono::seconds(5), std::chrono::milliseconds(20));
@@ -1492,8 +1493,8 @@ int main() {
     TestPlaybackPcmBuildsTagPlayBinaryPayload();
     std::cerr << "[ RUN      ] TestFrontendControlMessageParserRequiresTypedJsonFields\n";
     TestFrontendControlMessageParserRequiresTypedJsonFields();
-    std::cerr << "[ RUN      ] TestFrontendControlSocketDisconnectsEnterFault\n";
-    TestFrontendControlSocketDisconnectsEnterFault();
+    std::cerr << "[ RUN      ] TestFrontendControlSocketDisconnectsReconnect\n";
+    TestFrontendControlSocketDisconnectsReconnect();
     std::cerr << "[ RUN      ] TestFrontendPlaybackReadErrorKeepsAcceptingClients\n";
     TestFrontendPlaybackReadErrorKeepsAcceptingClients();
     std::cerr << "[ RUN      ] TestFrontendMockSoundboxSmokeLoop\n";

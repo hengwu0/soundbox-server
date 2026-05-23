@@ -4,6 +4,10 @@
 
 ## 整体架构流程
 
+1. 小爱 WebSocket 音频 → frontend → KWS
+2. KWS 命中后 → session_start → llm_start → AEC → LlmClient(TCP) → LLM 服务端（VAD）
+3. LLM 服务端（VAD）end 后 → session_end 回调 → llm_stop → 回到 KWS
+
 ```mermaid
 graph TB
     XIAOAI["小爱音箱<br/>open-xiaoai-client"]
@@ -14,7 +18,7 @@ graph TB
 
             subgraph frontend_thread["frontend 线程"]
                 direction TB
-                FSM["Frontend 状态机<br/>kSessionEnd / kKws / kLlmStarting / kAec / kLlmStopping / kFault"]
+                FSM["Frontend 状态机<br/>kSessionInit / kSessionStopped / kSessionStarting / kSessionStarted / kSessionStopping"]
                 SB["SoundBoxClient<br/>WebSocket + AudioPipe + AudioRouter"]
                 LLMC["LlmClient (shared)<br/>TCP 连接"]
                 PLAY["playback.sock<br/>接受播放 PCM"]
@@ -76,7 +80,7 @@ flowchart TD
     L --> M["注册 SIGINT/SIGTERM 信号处理器"]
     M --> N["RunSupervisedWorkers<br/>{ aec, kws, frontend }"]
     N --> N1["Frontend::Run()"]
-    N1 --> N2["→ kKws 状态"]
+    N1 --> N2["→ kSessionStopped 状态"]
     N2 --> N3["连接 KWS/AEC Unix socket"]
     N3 --> N4["创建 SoundBoxClient"]
     N4 --> N5["client_->Start()"]
@@ -98,33 +102,33 @@ flowchart TD
 
 ```mermaid
 stateDiagram-v2
-    [*] --> kSessionEnd : 进程启动
-    kSessionEnd --> kKws : startup / start_recording_ok
-    kKws --> kLlmStarting : session_start (kws_hit)
-    kLlmStarting --> kAec : llm_start_ok
-    kLlmStarting --> kKws : llm_start_failed / timeout (回退)
-    kAec --> kLlmStopping : session_end (vad_end 等)
-    kLlmStopping --> kKws : llm_stop_ok
-    kLlmStopping --> kKws : llm_stop_failed (重置音频链路)
-    kLlmStarting --> kFault : 超时 / 失败
-    kLlmStopping --> kFault : 超时 / 失败
-    kKws --> kFault : KWS socket 断开 / WS 断开
-    kAec --> kFault : WS 断开
-    kFault --> [*] : EnterFaultAndStop() 进程退出
+    [*] --> kSessionStopped : startup
+    kSessionStopped --> kSessionStarting : session_start (kws_hit)
+    kSessionStarting --> kSessionStarted : llm_start_ok
+    kSessionStarting --> kSessionStopped : llm_start_failed / timeout (回退)
+    kSessionStarted --> kSessionStopping : session_stop (vad_end 等)
+    kSessionStopping --> kSessionStopped : llm_stop_ok
+    kSessionStopping --> kSessionStopped : llm_stop_failed (需重连ws音频链路)
+    kSessionStarting --> kSessionInit : 超时 / 失败 (重连)
+    kSessionStopping --> kSessionInit : 超时 / 失败 (重连)
+    kSessionStopped --> kSessionInit : KWS socket 断开 / WS 断开 (重连)
+    kSessionStarted --> kSessionInit : WS 断开 (重连)
+    kSessionInit --> kSessionStopped : 重连成功
+    kSessionInit --> [*] : 重连失败 进程退出
 ```
 
 状态转换规则：
 
 | 当前状态 | 事件 | 目标状态 | 说明 |
 |---------|------|---------|------|
-| kSessionEnd | startup | kKws | Frontend 启动 |
-| kKws | session_start (kws_hit) | kLlmStarting | KWS 唤醒命中 |
-| kLlmStarting | llm_start_ok | kAec | SoundBox 切换到 LLM raw 模式成功 |
-| kLlmStarting | llm_start_failed/timeout | kKws | 切换失败，回退等待下一次唤醒 |
-| kAec | session_end (vad_end) | kLlmStopping | LLM 会话结束 |
-| kLlmStopping | llm_stop_ok | kKws | SoundBox 切回 KWS 模式成功 |
-| kLlmStopping | llm_stop_failed | kKws | 停止失败仍回到 kKws，重置音频链路 |
-| 任意 | KWS socket 断开 / WS 断开 | kFault | 不可恢复错误 |
+| kSessionStopped | startup | kSessionStopped | Frontend 启动进入空闲状态 |
+| kSessionStopped | session_start (kws_hit) | kSessionStarting | KWS 唤醒命中 |
+| kSessionStarting | llm_start_ok | kSessionStarted | SoundBox 切换到 LLM raw 模式成功 |
+| kSessionStarting | llm_start_failed/timeout | kSessionStopped | 切换失败，回退等待下一次唤醒 |
+| kSessionStarted | session_stop (vad_end) | kSessionStopping | LLM 会话结束 |
+| kSessionStopping | llm_stop_ok | kSessionStopped | SoundBox 切回 KWS 模式成功 |
+| kSessionStopping | llm_stop_failed | kSessionStopped | 停止失败仍回到空闲，需重连ws音频链路 |
+| 任意 | AEC/KWS socket 断开 / WS 断开 | kSessionInit | 重连ws音频链路 |
 
 ## SoundBox 音频路由状态机 (AudioMode)
 
@@ -156,7 +160,7 @@ AudioMode 路由策略：
 ## 音频数据流转图
 
 ```mermaid
-flowchart LR
+flowchart TD
     subgraph xiaoai["小爱音箱"]
         OXA["open-xiaoai-client"]
     end
@@ -186,7 +190,7 @@ flowchart LR
     AECOUT --> LLMC["LlmClient TCP<br/>SendAudio()"]
     LLMC --> |"TCP 原始 PCM"| LLMS["LLM 服务端"]
     LLMS --> |"session_end<br/>vad_end 等"| LLMC
-    LLMC --> |"回调"| FSM2["Frontend 状态机<br/>kLlmStopping → kKws"]
+    LLMC --> |"回调"| FSM2["Frontend 状态机<br/>kSessionStopping → kSessionStopped"]
 
     PLAYIN --> |"外部 PCM 写入"| PCLIENT["PlaybackClientLoop<br/>→ PlayPcm"]
 ```
@@ -360,7 +364,7 @@ LLM 服务端（通过 TCP）发送的 `session_end`：
 {"type":"session_end","reason":"vad_end","timestamp_ms":123456}
 ```
 
-frontend 仅在 KWS 模式下接受 `session_start`。在其他状态下收到的重复 `session_start` 消息会被记录日志并忽略。`session_end` 从 LLM TCP 服务端接收（而非 AEC Socket），且仅在 AEC 模式下接受。
+frontend 仅在 kSessionStopped 状态下接受 `session_start`。在其他状态下收到的重复 `session_start` 消息会被记录日志并忽略。`session_end` 从 LLM TCP 服务端接收（而非 AEC Socket），且仅在 kSessionStarted 状态下接受。
 
 ## AEC MD5 测试
 

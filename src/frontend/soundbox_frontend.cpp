@@ -141,18 +141,16 @@ void ShutdownSocket(int fd) {
 // 返回：对应的中英文字符串名称
 const char* StateName(Frontend::State state) {
   switch (state) {
-    case Frontend::State::kSessionEnd:
-      return "SessionEnd";
-    case Frontend::State::kKws:
-      return "kws";
-    case Frontend::State::kLlmStarting:
-      return "LLMStarting";
-    case Frontend::State::kAec:
-      return "Aec";
-    case Frontend::State::kLlmStopping:
-      return "LLMStopping";
-    case Frontend::State::kFault:
-      return "Fault";
+    case Frontend::State::kSessionInit:
+      return "SessionInit";
+    case Frontend::State::kSessionStopped:
+      return "SessionStopped";
+    case Frontend::State::kSessionStarting:
+      return "SessionStarting";
+    case Frontend::State::kSessionStarted:
+      return "SessionStarted";
+    case Frontend::State::kSessionStopping:
+      return "SessionStopping";
   }
   return "Unknown";
 }
@@ -211,7 +209,7 @@ Frontend::Frontend(Options options) : options_(std::move(options)) {
       options_.playback_socket_path.empty()) {
     throw std::runtime_error("frontend socket paths must not be empty");
   }
-  // state_ 保持默认值 kSessionEnd，表示初始空闲状态
+  // state_ 保持默认值 kSessionInit，表示初始/重连状态
 }
 
 // 前端析构函数：调用 Stop() 安全释放所有资源
@@ -228,9 +226,9 @@ Frontend::State Frontend::state() const {
 
 // 启动前端主循环，完成以下初始化步骤：
 // 1. 重置停止标志
-// 2. 进入 kKws 状态（启动唤醒词检测）
+// 2. 进入 kSessionStopped 状态（空闲状态，等待唤醒）
 // 3. 连接 KWS 和 AEC Unix socket
-// 4. 注册 LLM 客户端的 session_end 回调
+// 4. 注册 LLM 客户端的 session_stop 回调
 // 5. 初始化 SoundBox 客户端并注册音频回调
 // 6. 启动 KWS 控制读取线程和播放接受线程
 // 7. 启动 SoundBox 客户端
@@ -239,8 +237,8 @@ Frontend::State Frontend::state() const {
 void Frontend::Run() {
   // 重置停止标志，允许重新运行
   stop_requested_.store(false);
-  // 启动时立即进入 KWS 状态开始唤醒词检测
-  SetState(State::kKws, "startup");
+  // 启动时立即进入空闲状态，等待唤醒
+  SetState(State::kSessionStopped, "startup");
 
   // 带重试连接 KWS 控制/音频 socket
   kws_socket_ = audio_processing_module::ConnectUnixSocketWithRetry(
@@ -249,7 +247,7 @@ void Frontend::Run() {
   aec_socket_ = audio_processing_module::ConnectUnixSocketWithRetry(
       options_.aec_socket_path, kSocketConnectTimeout, kSocketRetryInterval);
 
-  // 注册 LLM 客户端会话结束回调：当 VAD 检测到静音超时或其他原因结束时触发
+  // 注册 LLM 客户端会话停止回调：当 VAD 检测到静音超时或其他原因结束时触发
   if (options_.llm_client) {
     llm_client_ = options_.llm_client;
     llm_client_->set_session_end_callback(
@@ -259,7 +257,7 @@ void Frontend::Run() {
   // 配置 SoundBox 客户端回调：
   //   on_wakeup_audio：接收唤醒词的原始音频流
   //   on_audio：接收话筒/喇叭音频用于 AEC 处理
-  //   on_connection_closed：SoundBox 连接意外断开时的异常处理
+  //   on_connection_closed：SoundBox 连接意外断开时进入重连状态
   xiaoai_server::soundbox::SoundBoxClient::Callbacks callbacks;
   callbacks.on_wakeup_audio = [this](const std::vector<uint8_t>& chunk) {
     OnWakeupAudio(chunk);
@@ -269,7 +267,7 @@ void Frontend::Run() {
   };
   callbacks.on_connection_closed = [this](const std::string& reason) {
     kLog->warn("soundbox connection closed reason={}", reason);
-    EnterFaultAndStop("soundbox_connection_closed");
+    EnterSessionInitAndRestart("soundbox_connection_closed");
   };
   client_ = std::make_unique<xiaoai_server::soundbox::SoundBoxClient>(
       options_.soundbox_config, std::move(callbacks));
@@ -281,15 +279,15 @@ void Frontend::Run() {
 
   // 启动 SoundBox 客户端，连接到 SoundBox 服务器
   if (!client_->Start()) {
-    // 启动失败：进入故障状态并停止所有组件
+    // 启动失败：进入初始重连状态并停止所有组件
     const std::string error_detail = client_->LastConnectError();
-    SetState(State::kFault, "soundbox_start_failed");
+    SetState(State::kSessionInit, "soundbox_start_failed");
     Stop();
     throw std::runtime_error(
         error_detail.empty() ? "failed to start soundbox frontend" : error_detail);
   }
 
-  // 主线程阻塞等待停止信号（Stop() 或 EnterFaultAndStop() 会通知条件变量）
+  // 主线程阻塞等待停止信号（Stop() 或 EnterSessionInitAndRestart() 重连失败会通知条件变量）
   std::unique_lock<std::mutex> lock(mu_);
   stop_cv_.wait(lock, [this] { return stop_requested_.load(); });
 }
@@ -334,9 +332,9 @@ void Frontend::Stop() {
 
 // 唤醒音频回调：将 KWS 音频数据写入 KWS socket 供唤醒词引擎处理
 // chunk：音频数据块（PCM 格式）
-// 仅在 kKws 状态下写入，其他状态丢弃该音频块（避免在会话中向 KWS 引擎注入无关音频）
+// 仅在 kSessionStopped 状态下写入，其他状态丢弃该音频块（避免在会话中向 KWS 引擎注入无关音频）
 void Frontend::OnWakeupAudio(const std::vector<uint8_t>& chunk) {
-  if (state() != State::kKws) {
+  if (state() != State::kSessionStopped) {
     kLog->debug("drop KWS audio while state={}", StateName(state()));
     return;
   }
@@ -345,9 +343,9 @@ void Frontend::OnWakeupAudio(const std::vector<uint8_t>& chunk) {
 
 // AEC 音频回调：将话筒/喇叭音频数据写入 AEC socket 供回声消除引擎处理
 // chunk：音频数据块（PCM 格式）
-// 仅在 kAec 状态下写入，其他状态丢弃（非会话期间无需 AEC 处理）
+// 仅在 kSessionStarted 状态下写入，其他状态丢弃（非会话期间无需 AEC 处理）
 void Frontend::OnAecAudio(const std::vector<uint8_t>& chunk) {
-  if (state() != State::kAec) {
+  if (state() != State::kSessionStarted) {
     kLog->debug("drop AEC audio while state={}", StateName(state()));
     return;
   }
@@ -363,11 +361,11 @@ void Frontend::OnAecProcessedAudio(const std::vector<uint8_t>& processed_pcm) {
   }
 }
 
-// LLM 会话结束回调：由 LLM 客户端在会话结束时调用（如 VAD 静音超时）
-// reason：会话结束原因字符串
-// 转发给 HandleSessionEnd 执行状态转换，仅在 kAec 状态时有效
+// LLM 会话停止回调：由 LLM 客户端在会话结束时调用（如 VAD 静音超时）
+// reason：会话停止原因字符串
+// 转发给 HandleSessionStop 执行状态转换，仅在 kSessionStarted 状态时有效
 void Frontend::OnLlmSessionEnd(const std::string& reason) {
-  HandleSessionEnd(reason);
+  HandleSessionStop(reason);
 }
 
 // KWS 控制通道读取线程主循环：
@@ -389,11 +387,10 @@ void Frontend::KwsControlReaderLoop() {
       HandleSessionStart(message);
     }
   } catch (const std::exception& error) {
-    // 非正常停止时的异常：记录错误、进入故障状态并停止所有组件
+    // 非正常停止时的异常：记录错误、进入初始重连状态并重连音频链路
     if (!IsStopping()) {
       kLog->error("KWS control reader failed: {}", error.what());
-      SetState(State::kFault, "kws_control_reader_failed");
-      EnterFaultAndStop("kws_control_reader_failed");
+      EnterSessionInitAndRestart("kws_control_socket_disconnected");
     }
   }
 }
@@ -471,77 +468,129 @@ void Frontend::PlaybackClientLoop(int client_fd) {
   }
 }
 
-// 处理 session_start 消息：仅在 kKws 状态下有效，表示唤醒词命中，
+// 处理 session_start 消息：仅在 kSessionStopped 状态下有效，表示唤醒词命中，
 // 需要启动 LLM 会话。调用 SoundBox NotifyLlmStart() 通知下游启动 LLM 通道。
 // message：已解析的 session_start 控制消息，reason 为 "kws_hit"
-// 成功后进入 kAec 状态开始 AEC 处理，失败则回到 kKws 继续等待下一次唤醒。
+// 成功后进入 kSessionStarted 状态开始 AEC 处理，失败则回到 kSessionStopped 继续等待下一次唤醒。
 void Frontend::HandleSessionStart(const ControlMessage& message) {
-  if (state() != State::kKws) {
+  if (state() != State::kSessionStopped) {
     kLog->warn("ignore duplicate session_start while state={}", StateName(state()));
     return;
   }
-  // 进入 LLM 启动中状态
-  SetState(State::kLlmStarting,
+  // 进入会话启动中状态
+  SetState(State::kSessionStarting,
            message.reason.empty() ? "session_start" : message.reason.c_str());
   // 通知 SoundBox 启用 LLM 通道
   if (client_ && client_->NotifyLlmStart()) {
-    // LLM 启动成功：进入 AEC 状态，开始回声消除和音频转发
-    SetState(State::kAec, "llm_start_ok");
+    // LLM 通道启用成功：进入会话进行中状态，开始 AEC 处理和音频转发
+    SetState(State::kSessionStarted, "llm_start_ok");
     return;
   }
-  // LLM 启动失败：回到 KWS 状态继续等待下一次唤醒
-  SetState(State::kKws, "llm_start_failed");
+  // LLM 通道启用失败：回到空闲状态继续等待下一次唤醒
+  SetState(State::kSessionStopped, "llm_start_failed");
 }
 
-// 处理 session_end 消息：仅在 kAec 状态下有效，表示当前 LLM 会话已结束
+// 处理 session_stop 消息：仅在 kSessionStarted 状态下有效，表示当前 LLM 会话已结束
 //（如 VAD 静音超时或显式结束）。通知 SoundBox 停止 LLM 通道，
-// 最终回到 kKws 状态继续等待下一次唤醒。
-// reason：session 结束原因字符串
-// 成功后：kLlmStopping → kKws（回到唤醒词检测，等待下一次唤醒）
-// 失败后：kLlmStopping → kKws（即使停止失败也回到 kKws，重置信道）
-void Frontend::HandleSessionEnd(const std::string& reason) {
-  if (state() != State::kAec) {
-    // 非 kAec 状态收到 session_end 是异常情况，记录警告并忽略
-    kLog->warn("ignore session_end from LLM while state={}", StateName(state()));
+// 最终回到 kSessionStopped 状态继续等待下一次唤醒。
+// reason：session 停止原因字符串
+// 成功后：kSessionStopping → kSessionStopped（回到空闲状态，等待下一次唤醒）
+// 失败后：kSessionStopping → kSessionStopped（停止失败仍回到 kSessionStopped，但需重连ws音频链路）
+void Frontend::HandleSessionStop(const std::string& reason) {
+  if (state() != State::kSessionStarted) {
+    // 非 kSessionStarted 状态收到 session_stop 是异常情况，记录警告并忽略
+    kLog->warn("ignore session_stop from LLM while state={}", StateName(state()));
     return;
   }
-  // 进入 LLM 停止中状态
-  SetState(State::kLlmStopping,
-           reason.empty() ? "session_end" : reason.c_str());
+  // 进入会话停止中状态
+  SetState(State::kSessionStopping,
+           reason.empty() ? "session_stop" : reason.c_str());
   // 通知 SoundBox 停止 LLM 通道
   if (client_ && client_->NotifyLlmStop()) {
-    // LLM 停止成功：回到 kKws 状态，继续等待下一次唤醒
-    SetState(State::kKws, "llm_stop_ok");
+    // LLM 通道停止成功：回到空闲状态，继续等待下一次唤醒
+    SetState(State::kSessionStopped, "llm_stop_ok");
     return;
   }
-  // LLM 停止失败：仍然回到 kKws 状态，SoundBox 音频链路可能需重置
-  kLog->warn("llm_stop failed after session_end; resetting soundbox audio link");
-  SetState(State::kKws, "llm_stop_failed_reset");
+  // LLM 通道停止失败：仍回到空闲状态，需重连 ws 音频链路
+  kLog->warn("llm_stop failed after session_stop; reconnecting soundbox audio link");
+  EnterSessionInitAndRestart("llm_stop_failed");
 }
 
-// 进入故障状态并停止所有组件：
-// 设置状态为 kFault、关闭所有 socket 连接、断开 LLM 和 SoundBox 客户端、
-// 通知条件变量唤醒 Run() 主循环以退出。
-// reason：故障原因描述，用于日志诊断
-void Frontend::EnterFaultAndStop(const char* reason) {
-  // 设置故障状态
-  SetState(State::kFault, reason);
-  // 设置停止标志并通知条件变量，使 Run() 主循环退出
-  const bool was_stopped = stop_requested_.exchange(true);
-  stop_cv_.notify_all();
-  // 立即断开所有 socket 和客户端连接，无需等待线程 join
+// 进入初始重连状态并尝试恢复音频链路：
+// 设置状态为 kSessionInit、断开当前 SoundBox 客户端连接、
+// 尝试重连 WebSocket 音频链路。重连成功后回到 kSessionStopped 空闲状态，
+// 重连失败则设置停止标志并通知 Run() 主循环退出。
+// reason：断连原因描述，用于日志诊断
+void Frontend::EnterSessionInitAndRestart(const char* reason) {
+  // 设置初始重连状态
+  SetState(State::kSessionInit, reason);
+  // 断开当前 SoundBox 客户端连接
+  if (client_) {
+    client_->Stop();
+  }
+  // 关闭 KWS 和 AEC socket 读写通道
   ShutdownSocket(kws_socket_.get());
   ShutdownSocket(aec_socket_.get());
   kws_socket_.reset();
   aec_socket_.reset();
-  if (llm_client_) {
-    llm_client_->Disconnect();
+  // 尝试重连 WebSocket 音频链路
+  if (RestartSoundboxAudioLink()) {
+    // 重连成功：回到空闲状态，等待下一次唤醒
+    SetState(State::kSessionStopped, "reconnect_ok");
+    return;
   }
-  if (client_) {
-    client_->Stop();
-  }
+  // 重连失败：设置停止标志，通知 Run() 主循环退出
+  kLog->error("failed to reconnect soundbox audio link; stopping");
+  const bool was_stopped = stop_requested_.exchange(true);
+  stop_cv_.notify_all();
   if (!was_stopped) {
     kLog->info("stop requested");
+  }
+}
+
+// 重连 WebSocket 音频链路：重新启动 SoundBox 客户端并恢复远端音频。
+// 重连流程：重新建立 WS 连接 → 重新连接 KWS/AEC Unix socket → 启动 KWS 控制读取线程
+// 返回：重连成功返回 true，失败返回 false（所有异常被捕获，不会向上抛出）。
+bool Frontend::RestartSoundboxAudioLink() {
+  try {
+    // 重新注册 SoundBox 客户端回调
+    xiaoai_server::soundbox::SoundBoxClient::Callbacks callbacks;
+    callbacks.on_wakeup_audio = [this](const std::vector<uint8_t>& chunk) {
+      OnWakeupAudio(chunk);
+    };
+    callbacks.on_audio = [this](const std::vector<uint8_t>& chunk) {
+      OnAecAudio(chunk);
+    };
+    callbacks.on_connection_closed = [this](const std::string& reason) {
+      kLog->warn("soundbox connection closed during reconnect reason={}", reason);
+      EnterSessionInitAndRestart("soundbox_connection_closed_reconnect");
+    };
+    client_ = std::make_unique<xiaoai_server::soundbox::SoundBoxClient>(
+        options_.soundbox_config, std::move(callbacks));
+
+    // 重新建立 WS 连接
+    if (!client_->Start()) {
+      kLog->error("soundbox reconnect failed: {}", client_->LastConnectError());
+      return false;
+    }
+
+    // 重新连接 KWS/AEC Unix socket
+    kws_socket_ = audio_processing_module::ConnectUnixSocketWithRetry(
+        options_.kws_socket_path, kSocketConnectTimeout, kSocketRetryInterval);
+    aec_socket_ = audio_processing_module::ConnectUnixSocketWithRetry(
+        options_.aec_socket_path, kSocketConnectTimeout, kSocketRetryInterval);
+
+    // 重启 KWS 控制读取线程
+    if (kws_control_thread_.joinable()) {
+      kws_control_thread_.join();
+    }
+    kws_control_thread_ = std::thread([this] { KwsControlReaderLoop(); });
+
+    kLog->info("soundbox audio link reconnected");
+    return true;
+  } catch (const std::exception& e) {
+    kLog->error("soundbox reconnect exception: {}", e.what());
+    return false;
   }
 }
 
