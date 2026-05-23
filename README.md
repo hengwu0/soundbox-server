@@ -21,7 +21,7 @@ graph TB
                 FSM["Frontend 状态机<br/>kSessionInit / kSessionStopped / kSessionStarting / kSessionStarted / kSessionStopping"]
                 SB["SoundBoxClient<br/>WebSocket + AudioPipe + AudioRouter"]
                 LLMC["LlmClient (shared)<br/>TCP 连接"]
-                PLAY["playback.sock<br/>接受播放 PCM"]
+                PLAY["playback.sock<br/>frontend 监听<br/>外部播放程序写入"]
 
                 SB --> |"on_wakeup_audio<br/>1ch/16k"| KWS_SOCK
                 SB --> |"on_audio<br/>2ch/16k"| AEC_SOCK
@@ -328,19 +328,24 @@ AEC 处理后输出至 LLM 服务端：
 
 以 `socket_dir: "/tmp/soundbox-server"` 配置为例：
 
-```text
-/tmp/soundbox-server/frontend_kws.sock
-  frontend -> KWS：1ch/16k/S16 PCM
-  KWS -> frontend：session_start JSON 行
-
-/tmp/soundbox-server/frontend_aec.sock
-  frontend -> AEC：2ch/16k/S16 PCM
-
-/tmp/soundbox-server/frontend_playback.sock
-  模拟播放/LLM -> frontend：播放 PCM 数据
-```
+| Socket 路径 | 监听方（服务端） | 连接方（客户端） | 数据方向 | 数据格式 |
+|---|---|---|---|---|
+| `frontend_kws.sock` | KwsSocketServer（KWS 线程） | Frontend（frontend 线程） | 双向：frontend → KWS 写入 PCM；KWS → frontend 回写 session_start JSON | PCM: 1ch/16k/S16；JSON: `{"type":"session_start",...}` |
+| `frontend_aec.sock` | AecStreamProcessor（AEC 线程） | Frontend（frontend 线程） | 单向：frontend → AEC 写入 PCM | 2ch/16k/S16 |
+| `frontend_playback.sock` | Frontend PlaybackAcceptLoop（frontend 线程） | 外部播放程序（LLM TTS 等） | 单向：外部程序 → frontend 写入播放 PCM | 1ch/24k/S16 |
 
 所有监听 Socket 均为单客户端模式。当前客户端断开连接后，监听器会回到 `accept()` 状态等待下一个客户端接入。
+
+## 对外主动连接
+
+soundbox-server 进程会主动连接以下外部服务：
+
+| 连接目标 | 协议 | 默认地址 | 配置项 | 数据方向 | 数据格式 |
+|---|---|---|---|---|---|
+| open-xiaoai-client（小爱音箱） | WebSocket | `ws://192.168.0.50:4399/` | `soundbox.ws_url` / `soundbox.ws_token` | 双向：上行录音 PCM；下行播放 PCM + 控制命令响应 | PCM: 1ch/16k 或 2ch/16k；JSON: 响应和事件 |
+| LLM 服务端 | TCP | `127.0.0.1:7799` | `llm.host` / `llm.port` | 双向：上行 AEC 处理后音频；下行 session_end JSON | PCM: 1ch/16k/S16；JSON: `{"type":"session_end",...}` |
+
+AEC 处理后的音频通过 `AudioSink` 回调直接送给 `LlmClient` 的 TCP 连接（不经过本地 Socket）。仅在单元测试中使用 `aec_llm.sock` 将 AEC 输出写入本地 WAV 文件做 MD5 回归校验。
 
 ## AEC 输出路径
 
