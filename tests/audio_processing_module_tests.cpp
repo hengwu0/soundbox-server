@@ -2,6 +2,7 @@
 #include "apm/aec/webrtc_processor.hpp"
 #include "apm/kws/kws_socket_server.hpp"
 #include "apm/kws/kws_engine.hpp"
+#include "apm/kws/kws_zipformer.hpp"
 #include "common/audio_frame.hpp"
 #include "common/log.hpp"
 #include "common/unix_socket.hpp"
@@ -517,7 +518,7 @@ static void TestNewPipelineModulesExposeExpectedSocketRoles() {
   const std::string aec_to_llm = "/tmp/aec_to_llm.sock";
   const std::string output = "/tmp/audio_processing_module_roles.wav";
 
-  FileAudioStreamFrontend frontend("tests/fixtures/aec_2ch_16k.s16", frontend_to_aec);
+  FileAudioStreamFrontend frontend("tests/fixtures/aec_2ch_16k_default.s16", frontend_to_aec);
 
   auto aec_audio_sink = [](const std::vector<uint8_t>&) {};
   AecStreamProcessor aec(frontend_to_aec, aec_audio_sink, WebRtcProcessorOptions{});
@@ -531,14 +532,18 @@ static void TestNewPipelineModulesExposeExpectedSocketRoles() {
           "FileRecorder should own the AEC-facing listen socket");
 }
 
-// 测试 AEC 文件流水线输出 WAV 文件 MD5 与预期一致。
-static void TestAecFilePipelineMatchesExpectedWavMd5() {
+// AEC 文件流水线测试辅助函数：将输入音频流经 AEC 处理后输出 WAV，校验 MD5 与预期一致。
+// input_s16：输入 2ch/16k/S16 原始音频文件路径。
+// output_wav：AEC 处理后输出的 WAV 文件路径。
+// expected_md5_file：预期 MD5 文本文件路径。
+static void RunAecFilePipelineMd5Test(const std::string& input_s16,
+                                       const std::string& output_wav,
+                                       const std::string& expected_md5_file) {
   const std::filesystem::path temp_root = MakeTempDirectory("aec_md5");
   const std::string frontend_to_aec = (temp_root / "frontend_aec.sock").string();
   const std::string aec_to_llm = (temp_root / "aec_llm.sock").string();
-  const std::filesystem::path output_wav = "tests/fixtures/aec_processed.wav";
 
-  FileRecorder recorder(aec_to_llm, output_wav.string());
+  FileRecorder recorder(aec_to_llm, output_wav);
 
   std::vector<std::exception_ptr> errors(3);
   std::thread recorder_thread([&] {
@@ -553,7 +558,7 @@ static void TestAecFilePipelineMatchesExpectedWavMd5() {
                                       processed_pcm.size());
   };
   AecStreamProcessor aec(frontend_to_aec, aec_audio_sink, WebRtcProcessorOptions{});
-  FileAudioStreamFrontend frontend("tests/fixtures/aec_2ch_16k.s16", frontend_to_aec, false);
+  FileAudioStreamFrontend frontend(input_s16, frontend_to_aec, false);
 
   std::thread aec_thread([&] {
     try { aec.RunOneClient(); }
@@ -573,10 +578,34 @@ static void TestAecFilePipelineMatchesExpectedWavMd5() {
   }
 
   const std::string actual_md5 = ComputeMd5Hex(output_wav);
-  const std::string expected_md5 =
-      ReadTextFile("tests/fixtures/expected_aec_processed.md5");
+  const std::string expected_md5 = ReadTextFile(expected_md5_file);
   Require(actual_md5 == expected_md5,
-          "AEC processed wav md5 mismatch: expected " + expected_md5 + " got " + actual_md5);
+          "AEC processed wav md5 mismatch for " + input_s16 +
+          ": expected " + expected_md5 + " got " + actual_md5);
+}
+
+// 测试 AEC 文件流水线输出 WAV 文件 MD5 与预期一致（默认测试音频）。
+static void TestAecFilePipelineMatchesExpectedWavMd5() {
+  RunAecFilePipelineMd5Test(
+      "tests/fixtures/aec_2ch_16k_default.s16",
+      "tests/fixtures/aec_processed.wav",
+      "tests/fixtures/expected_aec_processed.md5");
+}
+
+// 测试 AEC 文件流水线输出 WAV 文件 MD5 与预期一致（故事音频）。
+static void TestAecFilePipelineMatchesExpectedWavMd5Gushi() {
+  RunAecFilePipelineMd5Test(
+      "tests/fixtures/aec_2ch_16k_gushi.s16",
+      "tests/fixtures/aec_processed_gushi.wav",
+      "tests/fixtures/expected_aec_processed_gushi.md5");
+}
+
+// 测试 AEC 文件流水线输出 WAV 文件 MD5 与预期一致（音乐音频）。
+static void TestAecFilePipelineMatchesExpectedWavMd5Music() {
+  RunAecFilePipelineMd5Test(
+      "tests/fixtures/aec_2ch_16k_music.s16",
+      "tests/fixtures/aec_processed_music.wav",
+      "tests/fixtures/expected_aec_processed_music.md5");
 }
 
 // 测试 AEC 处理器在前端客户端断开后可重新接受连接。
@@ -722,6 +751,64 @@ static void TestKwsSocketServerSendsSessionStartJsonLine() {
           "KWS server should include kws_hit reason");
   Require(line.find("\"keyword\":\"xiaoai\"") != std::string::npos,
           "KWS server should include the hit keyword");
+}
+
+// 测试 Zipformer KWS 引擎能从 1ch/16k/S16 原始音频文件中检测到唤醒词。
+static void TestKwsZipformerDetectsWakeWordFromFile() {
+  ScopedCurrentPath guard(std::filesystem::current_path());
+  xiaoai_server::config::Wakeup wakeup_cfg;
+  auto engine = std::make_unique<xiaoai_server::wakeup::ZipformerKwsEngine>(wakeup_cfg);
+
+  std::ifstream input("tests/fixtures/kws_1ch_16k_wake.s16", std::ios::binary);
+  Require(input.good(), "failed to open wake test audio file");
+
+  constexpr size_t kChunkBytes = 320;
+  std::vector<uint8_t> buffer(kChunkBytes);
+  bool detected = false;
+
+  while (input.read(reinterpret_cast<char*>(buffer.data()), buffer.size()) ||
+         input.gcount() > 0) {
+    const size_t bytes_read = static_cast<size_t>(input.gcount());
+    auto hit = engine->AcceptPcm16(buffer.data(), bytes_read, 16000, 1, 16);
+    if (hit.has_value()) {
+      detected = true;
+      break;
+    }
+    if (bytes_read < kChunkBytes) {
+      break;
+    }
+  }
+
+  Require(detected, "KWS engine should detect wake word from wake audio file");
+}
+
+// 测试 Zipformer KWS 引擎对不含唤醒词的 1ch/16k/S16 音频不会误触发。
+static void TestKwsZipformerRejectsNonWakeWordFromFile() {
+  ScopedCurrentPath guard(std::filesystem::current_path());
+  xiaoai_server::config::Wakeup wakeup_cfg;
+  auto engine = std::make_unique<xiaoai_server::wakeup::ZipformerKwsEngine>(wakeup_cfg);
+
+  std::ifstream input("tests/fixtures/kws_1ch_16k_nowake.s16", std::ios::binary);
+  Require(input.good(), "failed to open nowake test audio file");
+
+  constexpr size_t kChunkBytes = 320;
+  std::vector<uint8_t> buffer(kChunkBytes);
+  bool detected = false;
+
+  while (input.read(reinterpret_cast<char*>(buffer.data()), buffer.size()) ||
+         input.gcount() > 0) {
+    const size_t bytes_read = static_cast<size_t>(input.gcount());
+    auto hit = engine->AcceptPcm16(buffer.data(), bytes_read, 16000, 1, 16);
+    if (hit.has_value()) {
+      detected = true;
+      break;
+    }
+    if (bytes_read < kChunkBytes) {
+      break;
+    }
+  }
+
+  Require(!detected, "KWS engine should not detect wake word from non-wake audio file");
 }
 
 // 测试 Soundbox 音频路由器仅路由当前模式对应的回调。
@@ -1266,7 +1353,7 @@ static void TestParseOptionsLoadsConfigurationFromDirectory() {
 static void TestParseOptionsRejectsRemovedTuningFlags() {
   const std::vector<std::string> args = {
       "soundbox-server",
-      "--input", "tests/fixtures/aec_2ch_16k.s16",
+      "--input", "tests/fixtures/aec_2ch_16k_default.s16",
   };
   bool failed = false;
   try {
@@ -1479,6 +1566,10 @@ int main() {
     TestNewPipelineModulesExposeExpectedSocketRoles();
     std::cerr << "[ RUN      ] TestAecFilePipelineMatchesExpectedWavMd5\n";
     TestAecFilePipelineMatchesExpectedWavMd5();
+    std::cerr << "[ RUN      ] TestAecFilePipelineMatchesExpectedWavMd5Gushi\n";
+    TestAecFilePipelineMatchesExpectedWavMd5Gushi();
+    std::cerr << "[ RUN      ] TestAecFilePipelineMatchesExpectedWavMd5Music\n";
+    TestAecFilePipelineMatchesExpectedWavMd5Music();
     std::cerr << "[ RUN      ] TestAecStreamProcessorReacceptsFrontendClient\n";
     TestAecStreamProcessorReacceptsFrontendClient();
     std::cerr << "[ RUN      ] TestAecStreamProcessorCallsAudioSinkWithProcessedPcm\n";
@@ -1487,6 +1578,10 @@ int main() {
     TestLlmClientConnectsToTcpServerAndReceivesSessionEnd();
     std::cerr << "[ RUN      ] TestKwsSocketServerSendsSessionStartJsonLine\n";
     TestKwsSocketServerSendsSessionStartJsonLine();
+    std::cerr << "[ RUN      ] TestKwsZipformerDetectsWakeWordFromFile\n";
+    TestKwsZipformerDetectsWakeWordFromFile();
+    std::cerr << "[ RUN      ] TestKwsZipformerRejectsNonWakeWordFromFile\n";
+    TestKwsZipformerRejectsNonWakeWordFromFile();
     std::cerr << "[ RUN      ] TestSoundboxAudioRouterRoutesOnlyCurrentMode\n";
     TestSoundboxAudioRouterRoutesOnlyCurrentMode();
     std::cerr << "[ RUN      ] TestPlaybackPcmBuildsTagPlayBinaryPayload\n";

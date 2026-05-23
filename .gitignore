@@ -45,6 +45,8 @@ core.*
 *.wav
 !tests/**/*.wav
 /tests/fixtures/aec_processed.wav
+/tests/fixtures/aec_processed_gushi.wav
+/tests/fixtures/aec_processed_music.wav
 
 # Local IDE and OS metadata
 /.cache/
