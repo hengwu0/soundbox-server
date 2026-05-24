@@ -93,4 +93,34 @@ void WriteAll(int fd, const uint8_t* data, size_t byte_count);
 /// @throws std::runtime_error 读取异常时抛出。
 size_t ReadFrameOrEof(int fd, uint8_t* data, size_t byte_count);
 
+/// 创建 TCP 服务端 socket，执行 socket -> bind -> listen。
+/// @param host    监听 IP 地址（如 "127.0.0.1"）。
+/// @param port    监听端口。
+/// @param backlog listen 队列最大长度。
+/// @return 包装好的服务端文件描述符。
+/// @throws std::runtime_error 任一系统调用失败时抛出。
+FileDescriptor CreateTcpServerSocket(const std::string& host, int port, int backlog);
+
+/// 带超时的 accept：在指定时间内等待 TCP 客户端连接。
+/// @param server_fd 已 listen 的 socket 描述符。
+/// @param timeout   最大等待时间。
+/// @return 包装好的客户端文件描述符。
+/// @throws std::runtime_error 超时或出错时抛出。
+FileDescriptor AcceptTcpClientWithTimeout(
+    int server_fd,
+    std::chrono::milliseconds timeout);
+
+/// 循环尝试连接 TCP 服务端，直到成功或超时。
+/// @param host           服务端 IP 地址。
+/// @param port           服务端端口。
+/// @param timeout        总超时时间。
+/// @param retry_interval 每次重试的间隔。
+/// @return 包装好的已连接客户端文件描述符。
+/// @throws std::runtime_error 超时或不可恢复错误时抛出。
+FileDescriptor ConnectTcpWithRetry(
+    const std::string& host,
+    int port,
+    std::chrono::milliseconds timeout,
+    std::chrono::milliseconds retry_interval);
+
 }  // namespace audio_processing_module

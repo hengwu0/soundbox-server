@@ -201,13 +201,16 @@ ControlMessage ParseControlMessageLine(const std::string& line,
   return parsed;
 }
 
-// 前端构造函数：存储选项并校验必填 socket 路径非空
+// 前端构造函数：存储选项并校验必填 socket 路径和 playback 地址非空
 // options：前端初始化选项
-// 异常：任一 socket 路径为空时抛出 std::runtime_error
+// 异常：任一 socket 路径或 playback 地址为空时抛出 std::runtime_error
 Frontend::Frontend(Options options) : options_(std::move(options)) {
   if (options_.kws_socket_path.empty() || options_.aec_socket_path.empty() ||
-      options_.playback_socket_path.empty()) {
-    throw std::runtime_error("frontend socket paths must not be empty");
+      options_.playback_host.empty()) {
+    throw std::runtime_error("frontend socket paths and playback host must not be empty");
+  }
+  if (options_.playback_port <= 0) {
+    throw std::runtime_error("frontend playback port must be positive");
   }
   // state_ 保持默认值 kSessionInit，表示初始/重连状态
 }
@@ -274,7 +277,7 @@ void Frontend::Run() {
 
   // 启动 KWS 控制消息读取线程：循环等待 session_start
   kws_control_thread_ = std::thread([this] { KwsControlReaderLoop(); });
-  // 启动播放接受线程：创建 playback Unix socket 并接受播放客户端
+  // 启动播放接受线程：创建 playback TCP 监听并接受播放客户端
   playback_thread_ = std::thread([this] { PlaybackAcceptLoop(); });
 
   // 启动 SoundBox 客户端，连接到 SoundBox 服务器
@@ -396,23 +399,22 @@ void Frontend::KwsControlReaderLoop() {
 }
 
 // 播放接受线程主循环：
-// 创建 playback Unix socket 服务器并循环接受播放客户端连接。
+// 创建 playback TCP 服务器并循环接受播放客户端连接。
 // 每次只保持一个活跃播放客户端；客户端断开后等待下一个连接。
 // 使用带超时的 accept 以响应 stop_requested_ 标志。
 void Frontend::PlaybackAcceptLoop() {
-  // 创建 Unix socket 服务器并绑定到 playback_socket_path
+  // 创建 TCP 服务器并绑定到 playback_host:playback_port
   audio_processing_module::FileDescriptor server =
-      audio_processing_module::CreateUnixServerSocket(options_.playback_socket_path, 1);
-  // SocketPathGuard 在作用域结束时自动清理 socket 文件
-  audio_processing_module::SocketPathGuard guard(options_.playback_socket_path);
-  kLog->info("playback listen ready socket={}", options_.playback_socket_path);
+      audio_processing_module::CreateTcpServerSocket(
+          options_.playback_host, options_.playback_port, 1);
+  kLog->info("playback listen ready {}:{}", options_.playback_host, options_.playback_port);
 
   while (!IsStopping()) {
     try {
       // 单客户端 listen：每次只接一个 playback writer，断开后重新 accept
       audio_processing_module::FileDescriptor client =
-          audio_processing_module::AcceptUnixClientWithTimeout(server.get(),
-                                                               kAcceptPollTimeout);
+          audio_processing_module::AcceptTcpClientWithTimeout(server.get(),
+                                                              kAcceptPollTimeout);
       try {
         // 进入客户端读取循环：读取 PCM 数据并写入 SoundBox 播放队列
         PlaybackClientLoop(client.get());
@@ -422,7 +424,7 @@ void Frontend::PlaybackAcceptLoop() {
           break;
         }
         kLog->warn("playback client failed: {}; waiting for next client",
-                   error.what());
+                    error.what());
       }
     } catch (const std::runtime_error& error) {
       if (IsStopping()) {

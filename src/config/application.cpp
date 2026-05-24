@@ -335,10 +335,12 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
          << defaults.runtime.wakeup.kws_num_trailing_blanks << "\n"
          << "  min_trigger_interval_ms: "
          << defaults.runtime.wakeup.min_trigger_interval_ms << "\n"
-         << "playback:\n"
-         << "  sample_rate: " << defaults.runtime.playback.sample_rate << "\n"
-         << "  channels: " << defaults.runtime.playback.channels << "\n"
-         << "  bits_per_sample: " << defaults.runtime.playback.bits_per_sample << "\n"
+<< "playback:\n"
+          << "  host: \"" << defaults.runtime.playback.host << "\"\n"
+          << "  port: " << defaults.runtime.playback.port << "\n"
+          << "  sample_rate: " << defaults.runtime.playback.sample_rate << "\n"
+          << "  channels: " << defaults.runtime.playback.channels << "\n"
+          << "  bits_per_sample: " << defaults.runtime.playback.bits_per_sample << "\n"
          << "llm:\n"
          << "  host: \"" << defaults.runtime.llm.host << "\"\n"
          << "  port: " << defaults.runtime.llm.port << "\n"
@@ -423,6 +425,10 @@ void ApplyConfigEntry(PipelineOptions* options,
     options->runtime.wakeup.kws_num_trailing_blanks = ParseInt(value, key);
   } else if (key == "wakeup.min_trigger_interval_ms") {
     options->runtime.wakeup.min_trigger_interval_ms = ParseInt(value, key);
+  } else if (key == "playback.host") {
+    options->runtime.playback.host = value;
+  } else if (key == "playback.port") {
+    options->runtime.playback.port = ParseInt(value, key);
   } else if (key == "playback.sample_rate") {
     options->runtime.playback.sample_rate = ParseInt(value, key);
   } else if (key == "playback.channels") {
@@ -599,7 +605,6 @@ void CleanupStaleSocketFiles(const std::filesystem::path& socket_dir) {
       "frontend_kws.sock",       ///< KWS 唤醒词前端通信 socket。
       "frontend_aec.sock",       ///< AEC 回声消除前端通信 socket。
       "aec_llm.sock",            ///< AEC 到 LLM 音频转发 socket。
-      "frontend_playback.sock",  ///< 前端播放音频 socket。
   };
   for (const auto& name : socket_names) {
     const std::filesystem::path path = socket_dir / name;
@@ -783,8 +788,6 @@ int RunPipeline(const PipelineOptions& options) {
       (std::filesystem::path(options.socket_dir) / "frontend_kws.sock").string();
   const std::string frontend_aec_socket =
       (std::filesystem::path(options.socket_dir) / "frontend_aec.sock").string();
-  const std::string frontend_playback_socket =
-      (std::filesystem::path(options.socket_dir) / "frontend_playback.sock").string();
 
   // 创建 LLM 客户端并连接
   auto llm_client = std::make_shared<soundbox_server::llm::LlmClient>(
@@ -816,7 +819,8 @@ int RunPipeline(const PipelineOptions& options) {
   soundbox_server::frontend::Frontend::Options frontend_options;
   frontend_options.kws_socket_path = frontend_kws_socket;
   frontend_options.aec_socket_path = frontend_aec_socket;
-  frontend_options.playback_socket_path = frontend_playback_socket;
+  frontend_options.playback_host = options.runtime.playback.host;
+  frontend_options.playback_port = options.runtime.playback.port;
   frontend_options.soundbox_config = options.runtime;
   frontend_options.llm_client = llm_client;
   soundbox_server::frontend::Frontend frontend(frontend_options);

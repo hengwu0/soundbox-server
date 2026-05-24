@@ -21,7 +21,7 @@ graph TB
                 FSM["Frontend 状态机<br/>kSessionInit / kSessionStopped / kSessionStarting / kSessionStarted / kSessionStopping"]
                 SB["SoundBoxClient<br/>WebSocket + AudioPipe + AudioRouter"]
                 LLMC["LlmClient (shared)<br/>TCP 连接"]
-                PLAY["playback.sock<br/>frontend 监听<br/>外部播放程序写入"]
+                PLAY["TCP playback<br/>frontend 监听<br/>127.0.0.1:7789<br/>外部播放程序写入"]
 
                 SB --> |"on_wakeup_audio<br/>1ch/16k"| KWS_SOCK
                 SB --> |"on_audio<br/>2ch/16k"| AEC_SOCK
@@ -53,7 +53,7 @@ graph TB
     LLMS["LLM 服务端<br/>llm.host:llm.port"] <--> |"TCP<br/>PCM 上行 / session_end 下行"| LLMC
 ```
 
-播放 PCM 数据也可以通过 `frontend_playback.sock` 写出；frontend 会将其封装为 `tag=play` 的 WebSocket 二进制负载发送给小爱音箱。
+播放 PCM 数据也可以通过 TCP 连接 `playback.host:playback.port`（默认 `127.0.0.1:7789`）写入；frontend 会将其封装为 `tag=play` 的 WebSocket 二进制负载发送给小爱音箱。
 
 ## 主进程启动流程
 
@@ -174,7 +174,7 @@ flowchart TD
         AR --> |"Kws"| OWA["on_wakeup_audio<br/>1ch/16k/S16"]
         AR --> |"LlmWorking"| OA["on_audio<br/>2ch/16k/S16"]
         AR --> |"其他"| DROP["丢弃"]
-        PLAYIN["playback.sock<br/>1ch/24k/S16"] --> BPP["BuildPlayPcmPacket"]
+        PLAYIN["TCP playback<br/>1ch/24k/S16"] --> BPP["BuildPlayPcmPacket"]
         BPP --> WSOUT["WebSocket tag=play"]
     end
 
@@ -192,7 +192,7 @@ flowchart TD
     LLMS --> |"session_end<br/>vad_end 等"| LLMC
     LLMC --> |"回调"| FSM2["Frontend 状态机<br/>kSessionStopping → kSessionStopped"]
 
-    PLAYIN --> |"外部 PCM 写入"| PCLIENT["PlaybackClientLoop<br/>→ PlayPcm"]
+    PLAYIN --> |"外部 PCM TCP 写入"| PCLIENT["PlaybackClientLoop<br/>→ PlayPcm"]
 ```
 
 ## 编译构建
@@ -234,6 +234,8 @@ wakeup:
   min_trigger_interval_ms: 800
 
 playback:
+  host: "127.0.0.1"
+  port: 7789
   sample_rate: 24000
   channels: 1
   bits_per_sample: 16
@@ -319,22 +321,22 @@ AEC 处理后输出至 LLM 服务端：
 1ch / S16_LE / 16000 Hz，通过 TCP 发送原始 PCM
 ```
 
-播放 Socket 输入：
+播放 TCP 输入：
 ```text
 1ch / S16_LE / 24000 Hz
 ```
 
-## 本地 Socket 路径及职责
+## 本地 Socket 路径及对外 TCP 监听
 
 以 `socket_dir: "/tmp/soundbox-server"` 配置为例：
 
-| Socket 路径 | 监听方（服务端） | 连接方（客户端） | 数据方向 | 数据格式 |
+| 接口 | 监听方（服务端） | 连接方（客户端） | 数据方向 | 数据格式 |
 |---|---|---|---|---|
 | `frontend_kws.sock` | KwsSocketServer（KWS 线程） | Frontend（frontend 线程） | 双向：frontend → KWS 写入 PCM；KWS → frontend 回写 session_start JSON | PCM: 1ch/16k/S16；JSON: `{"type":"session_start",...}` |
 | `frontend_aec.sock` | AecStreamProcessor（AEC 线程） | Frontend（frontend 线程） | 单向：frontend → AEC 写入 PCM | 2ch/16k/S16 |
-| `frontend_playback.sock` | Frontend PlaybackAcceptLoop（frontend 线程） | 外部播放程序（LLM TTS 等） | 单向：外部程序 → frontend 写入播放 PCM | 1ch/24k/S16 |
+| TCP `playback.host:playback.port`（默认 `127.0.0.1:7789`） | Frontend PlaybackAcceptLoop（frontend 线程） | 外部播放程序（LLM TTS 等） | 单向：外部程序 → frontend 写入播放 PCM | 1ch/24k/S16 |
 
-所有监听 Socket 均为单客户端模式。当前客户端断开连接后，监听器会回到 `accept()` 状态等待下一个客户端接入。
+所有监听 Socket 均为单客户端模式。当前客户端断开连接后，监听器会回到 `accept()` 状态等待下一个客户端接入。播放 TCP 监听同样为单客户端模式。
 
 ## 对外主动连接
 
@@ -344,6 +346,7 @@ soundbox-server 进程会主动连接以下外部服务：
 |---|---|---|---|---|---|
 | open-xiaoai-client（小爱音箱） | WebSocket | `ws://192.168.0.50:4399/` | `soundbox.ws_url` / `soundbox.ws_token` | 双向：上行录音 PCM；下行播放 PCM + 控制命令响应 | PCM: 1ch/16k 或 2ch/16k；JSON: 响应和事件 |
 | LLM 服务端 | TCP | `127.0.0.1:7799` | `llm.host` / `llm.port` | 双向：上行 AEC 处理后音频；下行 session_end JSON | PCM: 1ch/16k/S16；JSON: `{"type":"session_end",...}` |
+| 播放程序（LLM TTS） | TCP | `127.0.0.1:7789` | `playback.host` / `playback.port` | 单向：播放程序 → frontend 写入播放 PCM | 1ch/24k/S16 |
 
 AEC 处理后的音频通过 `AudioSink` 回调直接送给 `LlmClient` 的 TCP 连接（不经过本地 Socket）。仅在单元测试中使用 `aec_llm.sock` 将 AEC 输出写入本地 WAV 文件做 MD5 回归校验。
 
@@ -417,7 +420,7 @@ frontend websocket 连接
   -> 经 AEC 处理后的音频发送至模拟 LLM TCP 服务端
   -> 模拟 LLM TCP 服务端发送 session_end
   -> llm_stop
-  -> 播放 PCM 以 websocket tag=play 转发
+  -> 播放 PCM 通过 TCP 连接 playback 端口并以 websocket tag=play 转发
 ```
 
 使用常规测试命令运行：
@@ -445,6 +448,9 @@ WebSocket 连接失败（启动时报错退出）
 
 LLM TCP 连接失败
 - 确认 LLM 服务端正在 `llm.host:llm.port`（默认 `127.0.0.1:7799`）上运行。LlmClient 会以 10 秒总超时时间重试 TCP 连接。
+
+播放 TCP 连接失败
+- 确认播放程序正在 `playback.host:playback.port`（默认 `127.0.0.1:7789`）上连接。播放程序连接失败时会自动重试。
 
 Socket 连接失败
 - 删除 `socket_dir` 目录下的残留 Socket 文件，或重启服务。服务启动时会自动清理残留的 Socket 文件。

@@ -114,8 +114,12 @@ struct Wakeup {
   int min_trigger_interval_ms{800};
 };
 
-// 描述本地播放设备（如 ALSA / PipeWire）开口时的 PCM 参数。
+// 描述本地播放设备（如 ALSA / PipeWire）开口时的 PCM 参数，以及播放 TCP 监听地址。
 struct PlaybackPreset {
+  // host 是播放 TCP 监听地址，默认本机回环地址。
+  std::string host{"127.0.0.1"};
+  // port 是播放 TCP 监听端口，默认 7789。
+  int port{7789};
   // sample_rate 是播放设备打开的采样率，默认 24000 Hz 与 xiaozhi 下行采样率保持一致。
   int sample_rate{24000};
   // channels 是播放声道数，默认单声道。

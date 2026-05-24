@@ -65,7 +65,8 @@ class Frontend {
   struct Options {
     std::string kws_socket_path;       // KWS 控制/音频 Unix socket 路径
     std::string aec_socket_path;       // AEC 音频 Unix socket 路径
-    std::string playback_socket_path;  // 播放 PCM 监听 socket 路径（用于流式播放输出）
+    std::string playback_host;         // 播放 PCM 监听 TCP 地址（用于流式播放输出）
+    int playback_port;                 // 播放 PCM 监听 TCP 端口
     xiaoai_server::config::Config soundbox_config;  // SoundBox 客户端连接配置
     std::shared_ptr<soundbox_server::llm::LlmClient> llm_client;  // LLM 客户端实例（可为空）
     size_t playback_read_chunk_bytes{4096};  // 播放流每次读取的缓冲区大小（字节）
@@ -105,7 +106,7 @@ class Frontend {
   void OnLlmSessionEnd(const std::string& reason);
   // KWS 控制通道读取线程：循环读取 session_start 消息并分发给 HandleSessionStart
   void KwsControlReaderLoop();
-  // 播放接受线程：创建 playback Unix socket 监听，循环接受播放客户端连接
+  // 播放接受线程：创建 playback TCP 监听，循环接受播放客户端连接
   void PlaybackAcceptLoop();
   // 播放客户端处理循环：从客户端 fd 读取 PCM 数据并写入 SoundBox 播放队列
   // client_fd：已接受的播放客户端 socket 文件描述符

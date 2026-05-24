@@ -1,5 +1,7 @@
 #include "common/unix_socket.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -243,6 +245,122 @@ size_t ReadFrameOrEof(int fd, uint8_t* data, size_t byte_count) {
     total += static_cast<size_t>(result);
   }
   return total;
+}
+
+/// 创建 TCP 服务端 socket，执行 socket+bind+listen。
+/// @param host    监听 IP 地址。
+/// @param port    监听端口。
+/// @param backlog listen 队列最大长度。
+/// @return 包装好的 FileDescriptor（服务端 socket）。
+/// @throws std::runtime_error 任一系统调用失败时抛出。
+FileDescriptor CreateTcpServerSocket(const std::string& host, int port, int backlog) {
+  FileDescriptor server(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+  if (!server.valid()) {
+    throw ErrnoError("socket");
+  }
+
+  int opt = 1;
+  if (::setsockopt(server.get(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    throw ErrnoError("setsockopt SO_REUSEADDR");
+  }
+
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<uint16_t>(port));
+  if (::inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1) {
+    throw std::runtime_error("invalid playback host address: " + host);
+  }
+
+  if (::bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+    throw ErrnoError("bind " + host + ":" + std::to_string(port));
+  }
+
+  if (::listen(server.get(), backlog) < 0) {
+    throw ErrnoError("listen " + host + ":" + std::to_string(port));
+  }
+
+  return server;
+}
+
+/// 在超时内循环 accept 一个 TCP 客户端连接，支持 EINTR 重试。
+/// @param server_fd 已 listen 的 socket 描述符。
+/// @param timeout   最大等待时间。
+/// @return 包装好的客户端 FileDescriptor。
+/// @throws std::runtime_error 超时或系统调用失败时抛出。
+FileDescriptor AcceptTcpClientWithTimeout(
+    int server_fd,
+    std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+  while (true) {
+    pollfd descriptor{};
+    descriptor.fd = server_fd;
+    descriptor.events = POLLIN;
+
+    const int poll_timeout = RemainingMilliseconds(deadline);
+    if (poll_timeout == 0) {
+      throw std::runtime_error("timed out waiting for tcp client");
+    }
+
+    const int ready = ::poll(&descriptor, 1, poll_timeout);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw ErrnoError("poll accept tcp");
+    }
+    if (ready == 0) {
+      throw std::runtime_error("timed out waiting for tcp client");
+    }
+
+    const int client_fd = ::accept4(server_fd, nullptr, nullptr, SOCK_CLOEXEC);
+    if (client_fd < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw ErrnoError("accept tcp");
+    }
+    return FileDescriptor(client_fd);
+  }
+}
+
+/// 循环尝试连接 TCP 服务端，直到成功或超时。
+/// @param host           服务端 IP 地址。
+/// @param port           服务端端口。
+/// @param timeout        总超时时间。
+/// @param retry_interval 每次重试间隔。
+/// @return 包装好的已连接客户端 FileDescriptor。
+/// @throws std::runtime_error 超时或非可重试的系统错误时抛出。
+FileDescriptor ConnectTcpWithRetry(
+    const std::string& host,
+    int port,
+    std::chrono::milliseconds timeout,
+    std::chrono::milliseconds retry_interval) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<uint16_t>(port));
+  if (::inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1) {
+    throw std::runtime_error("invalid playback host address: " + host);
+  }
+
+  while (std::chrono::steady_clock::now() < deadline) {
+    FileDescriptor client(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (!client.valid()) {
+      throw ErrnoError("socket");
+    }
+
+    if (::connect(client.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
+      return client;
+    }
+
+    if (errno != ECONNREFUSED && errno != EAGAIN) {
+      throw ErrnoError("connect " + host + ":" + std::to_string(port));
+    }
+    std::this_thread::sleep_for(retry_interval);
+  }
+
+  throw std::runtime_error("timed out connecting tcp: " + host + ":" + std::to_string(port));
 }
 
 }  // namespace audio_processing_module

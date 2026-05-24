@@ -918,7 +918,7 @@ static void TestFrontendControlSocketDisconnectsReconnect() {
   const std::filesystem::path temp_root = MakeTempDirectory("frontend_control_fault");
   const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
   const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
-  const std::string playback_socket = (temp_root / "frontend_playback.sock").string();
+  const int playback_port = GetFreeTcpPort();
 
   MockSoundboxWebSocketServer mock_soundbox;
   MockLlmTcpServer mock_llm;
@@ -963,10 +963,11 @@ static void TestFrontendControlSocketDisconnectsReconnect() {
     } catch (...) {}
   });
 
-  Frontend::Options options;
+Frontend::Options options;
   options.kws_socket_path = kws_socket;
   options.aec_socket_path = aec_socket;
-  options.playback_socket_path = playback_socket;
+  options.playback_host = "127.0.0.1";
+  options.playback_port = playback_port;
   options.soundbox_config.soundbox.ws_url = mock_soundbox.url();
   options.soundbox_config.soundbox.ws_token = "mock-token";
   options.soundbox_config.soundbox.connect_timeout_ms = 3000;
@@ -1021,7 +1022,7 @@ static void TestFrontendPlaybackReadErrorKeepsAcceptingClients() {
   const std::filesystem::path temp_root = MakeTempDirectory("frontend_playback_recover");
   const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
   const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
-  const std::string playback_socket = (temp_root / "frontend_playback.sock").string();
+  const int playback_port = GetFreeTcpPort();
 
   MockSoundboxWebSocketServer mock_soundbox;
   MockLlmTcpServer mock_llm;
@@ -1060,7 +1061,8 @@ static void TestFrontendPlaybackReadErrorKeepsAcceptingClients() {
   Frontend::Options options;
   options.kws_socket_path = kws_socket;
   options.aec_socket_path = aec_socket;
-  options.playback_socket_path = playback_socket;
+  options.playback_host = "127.0.0.1";
+  options.playback_port = playback_port;
   options.soundbox_config.soundbox.ws_url = mock_soundbox.url();
   options.soundbox_config.soundbox.ws_token = "mock-token";
   options.soundbox_config.soundbox.connect_timeout_ms = 3000;
@@ -1087,16 +1089,16 @@ static void TestFrontendPlaybackReadErrorKeepsAcceptingClients() {
                       std::chrono::seconds(5)),
             "frontend should finish soundbox startup");
 
-    auto failing_client = audio_processing_module::ConnectUnixSocketWithRetry(
-        playback_socket, std::chrono::seconds(5), std::chrono::milliseconds(20));
+    auto failing_client = audio_processing_module::ConnectTcpWithRetry(
+        "127.0.0.1", playback_port, std::chrono::seconds(5), std::chrono::milliseconds(20));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     failing_client.reset();
 
-    auto playback_client = audio_processing_module::ConnectUnixSocketWithRetry(
-        playback_socket, std::chrono::seconds(5), std::chrono::milliseconds(20));
+    auto playback_client = audio_processing_module::ConnectTcpWithRetry(
+        "127.0.0.1", playback_port, std::chrono::seconds(5), std::chrono::milliseconds(20));
     const std::vector<uint8_t> playback_pcm(320, 0x44);
     audio_processing_module::WriteAll(playback_client.get(), playback_pcm.data(),
-                                      playback_pcm.size());
+                                       playback_pcm.size());
     playback_client.reset();
     Require(WaitUntil([&] { return mock_soundbox.SawPlayPacket(); }, std::chrono::seconds(5)),
             "playback thread should accept a second client after a read error");
@@ -1125,7 +1127,7 @@ static void TestFrontendMockSoundboxSmokeLoop() {
   const std::filesystem::path temp_root = MakeTempDirectory("frontend_smoke");
   const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
   const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
-  const std::string playback_socket = (temp_root / "frontend_playback.sock").string();
+  const int playback_port = GetFreeTcpPort();
 
   MockSoundboxWebSocketServer mock_soundbox;
   MockLlmTcpServer mock_llm;
@@ -1176,7 +1178,8 @@ static void TestFrontendMockSoundboxSmokeLoop() {
   Frontend::Options options;
   options.kws_socket_path = kws_socket;
   options.aec_socket_path = aec_socket;
-  options.playback_socket_path = playback_socket;
+  options.playback_host = "127.0.0.1";
+  options.playback_port = playback_port;
   options.soundbox_config.soundbox.ws_url = mock_soundbox.url();
   options.soundbox_config.soundbox.ws_token = "mock-token";
   options.soundbox_config.soundbox.connect_timeout_ms = 3000;
@@ -1227,8 +1230,8 @@ static void TestFrontendMockSoundboxSmokeLoop() {
                       std::chrono::seconds(5)),
             "llm_stop_ok should return frontend to SessionEnd or reconnect");
 
-    auto playback_client = audio_processing_module::ConnectUnixSocketWithRetry(
-        playback_socket, std::chrono::seconds(5), std::chrono::milliseconds(20));
+    auto playback_client = audio_processing_module::ConnectTcpWithRetry(
+        "127.0.0.1", playback_port, std::chrono::seconds(5), std::chrono::milliseconds(20));
     const std::vector<uint8_t> playback_pcm(320, 0x33);
     audio_processing_module::WriteAll(playback_client.get(), playback_pcm.data(),
                                       playback_pcm.size());
