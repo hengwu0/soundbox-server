@@ -9,48 +9,56 @@
 3. LLM 服务端（VAD）end 后 → session_end 回调 → llm_stop → 回到 KWS
 
 ```mermaid
-graph TB
-    XIAOAI["小爱音箱<br/>open-xiaoai-client"]
+flowchart TB
+    XIAOAI["小爱音箱侧<br/>open-xiaoai-client"]
+    XIAOZHI["xiaozhi 项目<br/>LLM/VAD TCP 服务端"]
 
     subgraph process["soundbox-server 进程"]
-        subgraph supervisor["RunSupervisedWorkers (三条线程)"]
-            direction TB
+        direction TB
+        MAIN["RunPipeline<br/>创建共享 LlmClient 并 Connect()"]
+        LLMC["LlmClient (shared)<br/>TCP client → llm.host:llm.port"]
+        MAIN --> LLMC
+
+        subgraph supervisor["RunSupervisedWorkers<br/>aec / kws / frontend"]
+            direction LR
 
             subgraph frontend_thread["frontend 线程"]
                 direction TB
-                FSM["Frontend 状态机<br/>kSessionInit / kSessionStopped / kSessionStarting / kSessionStarted / kSessionStopping"]
+                FSM["Frontend 状态机<br/>Stopped → Starting → Started → Stopping"]
                 SB["SoundBoxClient<br/>WebSocket + AudioPipe + AudioRouter"]
-                LLMC["LlmClient (shared)<br/>TCP 连接"]
-                PLAY["TCP playback<br/>frontend 监听<br/>127.0.0.1:7789<br/>外部播放程序写入"]
+                PLAY["PlaybackAcceptLoop<br/>监听 playback.host:playback.port<br/>默认 127.0.0.1:7789"]
 
-                SB --> |"on_wakeup_audio<br/>1ch/16k"| KWS_SOCK
-                SB --> |"on_audio<br/>2ch/16k"| AEC_SOCK
-                KWS_SOCK --> |"session_start JSON"| FSM
                 FSM --> |"NotifyLlmStart / NotifyLlmStop"| SB
-                LLMC --> |"session_end 回调"| FSM
-                PLAY --> |"PlayPcm → tag=play"| SB
+                PLAY --> |"PCM → PlayPcm() → tag=play"| SB
             end
 
             subgraph kws_thread["KWS 线程"]
                 direction TB
                 KWS_SOCK["KwsSocketServer<br/>监听 frontend_kws.sock"]
                 KWS_ENG["Zipformer KWS 引擎"]
-                KWS_SOCK --> |"PCM → 检测"| KWS_ENG
-                KWS_ENG --> |"kws_hit → session_start"| KWS_SOCK
+                KWS_SOCK --> |"1ch/16k/S16 PCM"| KWS_ENG
+                KWS_ENG --> |"kws_hit → session_start JSON"| KWS_SOCK
             end
 
             subgraph aec_thread["AEC 线程"]
                 direction TB
                 AEC_SOCK["AecStreamProcessor<br/>监听 frontend_aec.sock"]
                 AEC_PROC["WebRTC NS/AGC/AEC<br/>2ch → 1ch"]
-                AEC_SOCK --> |"2ch PCM"| AEC_PROC
-                AEC_PROC --> |"1ch PCM AudioSink"| LLMC
+                AEC_SOCK --> |"2ch/16k/S16 PCM"| AEC_PROC
             end
         end
+
+        SB --> |"Kws 模式<br/>1ch/16k/S16"| KWS_SOCK
+        KWS_SOCK --> |"session_start JSON"| FSM
+        SB --> |"LlmWorking<br/>2ch/16k/S16"| AEC_SOCK
+        AEC_PROC --> |"AudioSink<br/>1ch/16k/S16"| LLMC
+        LLMC --> |"on_session_end(reason)"| FSM
     end
 
-    XIAOAI <--> |"WebSocket<br/>Bearer token 鉴权<br/>录音 PCM / 播放 PCM"| SB
-    LLMS["LLM 服务端<br/>llm.host:llm.port"] <--> |"TCP<br/>PCM 上行 / session_end 下行"| LLMC
+    XIAOAI <--> |"WebSocket<br/>Bearer token 鉴权<br/>录音 PCM / 播放 PCM / 控制命令"| SB
+    LLMC --> |"TCP 原始 PCM<br/>1ch/16k/S16"| XIAOZHI
+    XIAOZHI --> |"session_end JSON 行"| LLMC
+    XIAOZHI --> |"TCP 播放 PCM<br/>1ch/24k/S16"| PLAY
 ```
 
 播放 PCM 数据也可以通过 TCP 连接 `playback.host:playback.port`（默认 `127.0.0.1:7789`）写入；frontend 会将其封装为 `tag=play` 的 WebSocket 二进制负载发送给小爱音箱。
@@ -67,35 +75,39 @@ flowchart TD
     E --> F["ConfigureLogging()<br/>初始化日志"]
     F --> G["验证配置"]
     G --> G1{"ws_url 非空且<br/>ws:// 或 wss:// 开头?"}
-    G1 --> |"否"| EXIT1["❌ 报错退出"]
+    G1 --> |"否"| EXIT1["报错退出"]
     G1 --> |"是"| G2{"ws_token 非空?"}
-    G2 --> |"否"| EXIT2["❌ 报错退出"]
+    G2 --> |"否"| EXIT2["报错退出"]
     G2 --> |"是"| G3{"KWS 模型文件存在?"}
-    G3 --> |"否"| EXIT3["❌ 报错退出"]
+    G3 --> |"否"| EXIT3["报错退出"]
     G3 --> |"是"| H["CleanupStaleSocketFiles()<br/>清理残留 socket"]
-    H --> I["创建 LlmClient → Connect()"]
+    H --> I["创建共享 LlmClient<br/>Connect() 到 llm.host:llm.port"]
     I --> J["创建 AecStreamProcessor<br/>AudioSink → LlmClient.SendAudio"]
     J --> K["创建 KwsSocketServer<br/>ZipformerKwsEngine"]
-    K --> L["创建 Frontend"]
+    K --> L["创建 Frontend<br/>注入 shared LlmClient"]
     L --> M["注册 SIGINT/SIGTERM 信号处理器"]
-    M --> N["RunSupervisedWorkers<br/>{ aec, kws, frontend }"]
-    N --> N1["Frontend::Run()"]
-    N1 --> N2["→ kSessionStopped 状态"]
-    N2 --> N3["连接 KWS/AEC Unix socket"]
-    N3 --> N4["创建 SoundBoxClient"]
-    N4 --> N5["client_->Start()"]
-    N5 --> N5a["EnsureConnection()<br/>WS 连接小爱音箱"]
-    N5a --> N5a1{"连接成功?"}
-    N5a1 --> |"否"| EXIT4["❌ 报错退出<br/>区分 url error / token error"]
-    N5a1 --> |"是"| N5b["StartRemoteAudio()"]
-    N5b --> N5b1["start_play → fast_recording"]
-    N5b1 --> N5b2["→ AudioMode::Kws"]
-    N5b2 --> N5b3{"音频链路就绪?"}
-    N5b3 --> |"否"| EXIT5["❌ 报错退出"]
-    N5b3 --> |"是"| N6["启动 KWS 控制读取线程"]
-    N6 --> N7["启动播放接受线程"]
-    N7 --> N8["主线程阻塞等待停止信号"]
-    N --> |"任一 worker 异常"| N9["通知全体停止 → 逆序 stop() → 重新抛出异常"]
+    M --> N["RunSupervisedWorkers<br/>并行启动 aec / kws / frontend"]
+
+    N --> AEC_RUN["aec.Run()<br/>监听 frontend_aec.sock"]
+    N --> KWS_RUN["kws.Run()<br/>监听 frontend_kws.sock"]
+    N --> F0["Frontend::Run()"]
+
+    F0 --> F1["SetState(kSessionStopped)"]
+    F1 --> F2["连接 KWS/AEC Unix socket"]
+    F2 --> F3["注册 LlmClient session_end 回调"]
+    F3 --> F4["创建 SoundBoxClient"]
+    F4 --> F5["启动 KWS 控制读取线程"]
+    F5 --> F6["启动 PlaybackAcceptLoop 线程"]
+    F6 --> F7["client_->Start()"]
+    F7 --> F8["EnsureConnection()<br/>WS 连接小爱音箱"]
+    F8 --> F8a{"连接成功?"}
+    F8a --> |"否"| EXIT4["报错退出<br/>区分 url error / token error"]
+    F8a --> |"是"| F9["StartRemoteAudio()"]
+    F9 --> F10["start_play → fast_recording"]
+    F10 --> F11["AudioMode::Kws"]
+    F11 --> F12["阻塞等待停止信号"]
+
+    N --> |"任一 worker 异常或停止信号"| STOP["通知全体停止<br/>逆序 stop() → join → 重新抛出首个异常"]
 ```
 
 ## Frontend 状态机
@@ -161,11 +173,10 @@ AudioMode 路由策略：
 
 ```mermaid
 flowchart TD
-    subgraph xiaoai["小爱音箱"]
-        OXA["open-xiaoai-client"]
-    end
+    OXA["小爱音箱侧<br/>open-xiaoai-client"]
+    XZ["xiaozhi / LLM 服务端"]
 
-    subgraph client["SoundBoxClient"]
+    subgraph frontend["frontend 线程"]
         direction TB
         WSIN["WebSocket 收包"] --> PP["PacketParser"]
         PP --> RA["RecordAudio"]
@@ -173,26 +184,28 @@ flowchart TD
         AP --> AR["AudioRouter<br/>按 AudioMode 路由"]
         AR --> |"Kws"| OWA["on_wakeup_audio<br/>1ch/16k/S16"]
         AR --> |"LlmWorking"| OA["on_audio<br/>2ch/16k/S16"]
-        AR --> |"其他"| DROP["丢弃"]
-        PLAYIN["TCP playback<br/>1ch/24k/S16"] --> BPP["BuildPlayPcmPacket"]
-        BPP --> WSOUT["WebSocket tag=play"]
+        AR --> |"其他状态"| DROP["丢弃"]
+
+        PLAYTCP["TCP playback writer<br/>xiaozhi TTS PCM"] --> PCLIENT["PlaybackClientLoop"]
+        PCLIENT --> PLAYPCM["SoundBoxClient.PlayPcm()"]
+        PLAYPCM --> BPP["BuildPlayPcmPacket<br/>tag=play"]
+        BPP --> WSOUT["WebSocket binary"]
     end
 
-    OXA <--> |"WebSocket<br/>Bearer token 鉴权<br/>录音/播放 PCM"| WSIN
-    WSOUT --> |"tag=play 二进制帧"| OXA
+    OXA --> |"WebSocket record PCM"| WSIN
+    WSOUT --> |"tag=play 播放 PCM"| OXA
 
-    OWA --> |"1ch/16k/S16"| KWSS["KWS Socket Server<br/>Zipformer KWS 引擎"]
-    KWSS --> |"session_start JSON"| FSM["Frontend 状态机"]
+    OWA --> |"1ch/16k/S16"| KWSS["KwsSocketServer<br/>Zipformer KWS 引擎"]
+    KWSS --> |"session_start JSON"| FSM["Frontend 状态机<br/>llm_start"]
+    FSM --> |"llm_start / llm_stop"| OXA
 
-    OA --> |"2ch/16k/S16"| AECS["AEC Socket<br/>AecStreamProcessor"]
-    AECS --> |"WebRTC NS/AGC/AEC"| AECOUT["1ch/16k/S16<br/>AudioSink"]
-
-    AECOUT --> LLMC["LlmClient TCP<br/>SendAudio()"]
-    LLMC --> |"TCP 原始 PCM"| LLMS["LLM 服务端"]
-    LLMS --> |"session_end<br/>vad_end 等"| LLMC
-    LLMC --> |"回调"| FSM2["Frontend 状态机<br/>kSessionStopping → kSessionStopped"]
-
-    PLAYIN --> |"外部 PCM TCP 写入"| PCLIENT["PlaybackClientLoop<br/>→ PlayPcm"]
+    OA --> |"2ch/16k/S16"| AECS["AecStreamProcessor"]
+    AECS --> |"WebRTC NS/AGC/AEC"| AECOUT["AudioSink<br/>1ch/16k/S16"]
+    AECOUT --> LLMC["LlmClient.SendAudio()"]
+    LLMC --> |"TCP 原始 PCM"| XZ
+    XZ --> |"session_end JSON 行"| LLMC
+    LLMC --> |"回调 reason"| FSM2["Frontend 状态机<br/>llm_stop"]
+    XZ --> |"TCP 播放 PCM<br/>1ch/24k/S16"| PLAYTCP
 ```
 
 ## 编译构建
