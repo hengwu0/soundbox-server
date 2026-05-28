@@ -5,18 +5,18 @@
 ## 整体架构流程
 
 1. 小爱 WebSocket 音频 → frontend → KWS
-2. KWS 命中后 → session_start → llm_start → AEC → LlmClient(TCP) → LLM 服务端（VAD）
-3. LLM 服务端（VAD）end 后 → session_end 回调 → llm_stop → 回到 KWS
+2. KWS 命中后 → 进入 kSessionStarting → xiaozhi 命令通道发送 session_start → llm_start → AEC → xiaozhi 音频通道
+3. xiaozhi 命令通道返回 session_end → llm_stop → 回到 KWS；音频通道下行 24k PCM 直接播放
 
 ```mermaid
 flowchart TB
     XIAOAI["小爱音箱侧<br/>open-xiaoai-client"]
-    XIAOZHI["xiaozhi 项目<br/>LLM/VAD TCP 服务端"]
+    XIAOZHI["xiaozhi 项目<br/>TCP Server"]
 
     subgraph process["soundbox-server 进程"]
         direction TB
         MAIN["RunPipeline<br/>创建共享 LlmClient 并 Connect()"]
-        LLMC["LlmClient (shared)<br/>TCP client → llm.host:llm.port"]
+        LLMC["LlmClient (shared)<br/>audio: llm.host:llm.port<br/>command: command.host:command.port"]
         MAIN --> LLMC
 
         subgraph supervisor["RunSupervisedWorkers<br/>aec / kws / frontend"]
@@ -26,10 +26,7 @@ flowchart TB
                 direction TB
                 FSM["Frontend 状态机<br/>Stopped → Starting → Started → Stopping"]
                 SB["SoundBoxClient<br/>WebSocket + AudioPipe + AudioRouter"]
-                PLAY["PlaybackAcceptLoop<br/>监听 playback.host:playback.port<br/>默认 127.0.0.1:7789"]
-
                 FSM --> |"NotifyLlmStart / NotifyLlmStop"| SB
-                PLAY --> |"PCM → PlayPcm() → tag=play"| SB
             end
 
             subgraph kws_thread["KWS 线程"]
@@ -53,15 +50,17 @@ flowchart TB
         SB --> |"LlmWorking<br/>2ch/16k/S16"| AEC_SOCK
         AEC_PROC --> |"AudioSink<br/>1ch/16k/S16"| LLMC
         LLMC --> |"on_session_end(reason)"| FSM
+        LLMC --> |"PlayPcm()<br/>tag=play"| SB
     end
 
     XIAOAI <--> |"WebSocket<br/>Bearer token 鉴权<br/>录音 PCM / 播放 PCM / 控制命令"| SB
-    LLMC --> |"TCP 原始 PCM<br/>1ch/16k/S16"| XIAOZHI
-    XIAOZHI --> |"session_end JSON 行"| LLMC
-    XIAOZHI --> |"TCP 播放 PCM<br/>1ch/24k/S16"| PLAY
+    LLMC --> |"音频通道上行<br/>1ch/16k/S16"| XIAOZHI
+    XIAOZHI --> |"音频通道下行<br/>1ch/24k/S16"| LLMC
+    LLMC --> |"命令通道 session_start JSON 行"| XIAOZHI
+    XIAOZHI --> |"命令通道 session_end JSON 行"| LLMC
 ```
 
-播放 PCM 数据也可以通过 TCP 连接 `playback.host:playback.port`（默认 `127.0.0.1:7789`）写入；frontend 会将其封装为 `tag=play` 的 WebSocket 二进制负载发送给小爱音箱。
+xiaozhi 音频通道下行 PCM 固定为 `16bit / 24kHz / 1ch`，frontend 会将其封装为 `tag=play` 的 WebSocket 二进制负载发送给小爱音箱。
 
 ## 主进程启动流程
 
@@ -81,7 +80,7 @@ flowchart TD
     G2 --> |"是"| G3{"KWS 模型文件存在?"}
     G3 --> |"否"| EXIT3["报错退出"]
     G3 --> |"是"| H["CleanupStaleSocketFiles()<br/>清理残留 socket"]
-    H --> I["创建共享 LlmClient<br/>Connect() 到 llm.host:llm.port"]
+    H --> I["创建共享 LlmClient<br/>Connect() 到 xiaozhi 音频/命令通道"]
     I --> J["创建 AecStreamProcessor<br/>AudioSink → LlmClient.SendAudio"]
     J --> K["创建 KwsSocketServer<br/>ZipformerKwsEngine"]
     K --> L["创建 Frontend<br/>注入 shared LlmClient"]
@@ -94,11 +93,10 @@ flowchart TD
 
     F0 --> F1["SetState(kSessionStopped)"]
     F1 --> F2["连接 KWS/AEC Unix socket"]
-    F2 --> F3["注册 LlmClient session_end 回调"]
+    F2 --> F3["注册 LlmClient session_end / playback 回调"]
     F3 --> F4["创建 SoundBoxClient"]
     F4 --> F5["启动 KWS 控制读取线程"]
-    F5 --> F6["启动 PlaybackAcceptLoop 线程"]
-    F6 --> F7["client_->Start()"]
+    F5 --> F7["client_->Start()"]
     F7 --> F8["EnsureConnection()<br/>WS 连接小爱音箱"]
     F8 --> F8a{"连接成功?"}
     F8a --> |"否"| EXIT4["报错退出<br/>区分 url error / token error"]
@@ -135,9 +133,9 @@ stateDiagram-v2
 |---------|------|---------|------|
 | kSessionStopped | startup | kSessionStopped | Frontend 启动进入空闲状态 |
 | kSessionStopped | session_start (kws_hit) | kSessionStarting | KWS 唤醒命中 |
-| kSessionStarting | llm_start_ok | kSessionStarted | SoundBox 切换到 LLM raw 模式成功 |
+| kSessionStarting | xiaozhi session_start 已发送且 llm_start_ok | kSessionStarted | xiaozhi 会话启动，SoundBox 切换到 LLM raw 模式成功 |
 | kSessionStarting | llm_start_failed/timeout | kSessionStopped | 切换失败，回退等待下一次唤醒 |
-| kSessionStarted | session_stop (vad_end) | kSessionStopping | LLM 会话结束 |
+| kSessionStarted | session_stop (vad_end) | kSessionStopping | xiaozhi 会话结束 |
 | kSessionStopping | llm_stop_ok | kSessionStopped | SoundBox 切回 KWS 模式成功 |
 | kSessionStopping | llm_stop_failed | kSessionStopped | 停止失败仍回到空闲，需重连ws音频链路 |
 | 任意 | AEC/KWS socket 断开 / WS 断开 | kSessionInit | 重连ws音频链路 |
@@ -174,7 +172,7 @@ AudioMode 路由策略：
 ```mermaid
 flowchart TD
     OXA["小爱音箱侧<br/>open-xiaoai-client"]
-    XZ["xiaozhi / LLM 服务端"]
+    XZ["xiaozhi TCP Server"]
 
     subgraph frontend["frontend 线程"]
         direction TB
@@ -186,8 +184,7 @@ flowchart TD
         AR --> |"LlmWorking"| OA["on_audio<br/>2ch/16k/S16"]
         AR --> |"其他状态"| DROP["丢弃"]
 
-        PLAYTCP["TCP playback writer<br/>xiaozhi TTS PCM"] --> PCLIENT["PlaybackClientLoop"]
-        PCLIENT --> PLAYPCM["SoundBoxClient.PlayPcm()"]
+        LLMCPLAY["LlmClient 音频读取线程<br/>xiaozhi 下行 24k PCM"] --> PLAYPCM["SoundBoxClient.PlayPcm()"]
         PLAYPCM --> BPP["BuildPlayPcmPacket<br/>tag=play"]
         BPP --> WSOUT["WebSocket binary"]
     end
@@ -197,15 +194,15 @@ flowchart TD
 
     OWA --> |"1ch/16k/S16"| KWSS["KwsSocketServer<br/>Zipformer KWS 引擎"]
     KWSS --> |"session_start JSON"| FSM["Frontend 状态机<br/>llm_start"]
-    FSM --> |"llm_start / llm_stop"| OXA
+    FSM --> |"session_start → xiaozhi 命令通道<br/>llm_start / llm_stop → 小爱"| OXA
 
     OA --> |"2ch/16k/S16"| AECS["AecStreamProcessor"]
     AECS --> |"WebRTC NS/AGC/AEC"| AECOUT["AudioSink<br/>1ch/16k/S16"]
     AECOUT --> LLMC["LlmClient.SendAudio()"]
-    LLMC --> |"TCP 原始 PCM"| XZ
-    XZ --> |"session_end JSON 行"| LLMC
+    LLMC --> |"音频通道上行 PCM"| XZ
+    XZ --> |"命令通道 session_end JSON 行"| LLMC
     LLMC --> |"回调 reason"| FSM2["Frontend 状态机<br/>llm_stop"]
-    XZ --> |"TCP 播放 PCM<br/>1ch/24k/S16"| PLAYTCP
+    XZ --> |"音频通道下行 PCM<br/>1ch/24k/S16"| LLMCPLAY
 ```
 
 ## 编译构建
@@ -246,12 +243,9 @@ wakeup:
   kws_num_trailing_blanks: 0
   min_trigger_interval_ms: 800
 
-playback:
+command:
   host: "127.0.0.1"
   port: 7789
-  sample_rate: 24000
-  channels: 1
-  bits_per_sample: 16
 
 llm:
   host: "127.0.0.1"
@@ -307,9 +301,11 @@ soundbox:
   ws_token: "whsn1oeo"
 ```
 
-## LLM 服务端前置要求
+## xiaozhi 前置要求
 
-需要有一个独立的 LLM 服务端运行在 `llm.host:llm.port` 指定的地址上（默认为 `127.0.0.1:7799`）。LLM 服务端通过 TCP 接收经过 AEC 处理后的音频数据（1ch/S16_LE/16kHz），并在会话需要结束时发送 `session_end` JSON 行：
+需要有一个独立的 xiaozhi TCP Server：音频通道监听 `llm.host:llm.port`（默认 `127.0.0.1:7799`），命令通道监听 `command.host:command.port`（默认 `127.0.0.1:7789`）。soundbox-server 会作为 TCP Client 主动连接两个通道。
+
+命令通道使用 JSON 行协议，KWS 命中后 soundbox-server 会发送 `session_start`；xiaozhi 需要结束会话时发送 `session_end`：
 
 ```json
 {"type":"session_end","reason":"vad_end","timestamp_ms":123456}
@@ -329,17 +325,17 @@ AEC 模式：
 声道1 = 播放参考信号
 ```
 
-AEC 处理后输出至 LLM 服务端：
+AEC 处理后输出至 xiaozhi 音频通道：
 ```text
 1ch / S16_LE / 16000 Hz，通过 TCP 发送原始 PCM
 ```
 
-播放 TCP 输入：
+xiaozhi 音频通道下行播放音频：
 ```text
-1ch / S16_LE / 24000 Hz
+1ch / S16_LE / 24000 Hz，固定格式，不从 YAML 配置
 ```
 
-## 本地 Socket 路径及对外 TCP 监听
+## 本地 Socket 与 xiaozhi TCP 通道
 
 以 `socket_dir: "/tmp/soundbox-server"` 配置为例：
 
@@ -347,25 +343,20 @@ AEC 处理后输出至 LLM 服务端：
 |---|---|---|---|---|
 | `frontend_kws.sock` | KwsSocketServer（KWS 线程） | Frontend（frontend 线程） | 双向：frontend → KWS 写入 PCM；KWS → frontend 回写 session_start JSON | PCM: 1ch/16k/S16；JSON: `{"type":"session_start",...}` |
 | `frontend_aec.sock` | AecStreamProcessor（AEC 线程） | Frontend（frontend 线程） | 单向：frontend → AEC 写入 PCM | 2ch/16k/S16 |
-| TCP `playback.host:playback.port`（默认 `127.0.0.1:7789`） | Frontend PlaybackAcceptLoop（frontend 线程） | 外部播放程序（LLM TTS 等） | 单向：外部程序 → frontend 写入播放 PCM | 1ch/24k/S16 |
-
-所有监听 Socket 均为单客户端模式。当前客户端断开连接后，监听器会回到 `accept()` 状态等待下一个客户端接入。播放 TCP 监听同样为单客户端模式。
-
-## 对外主动连接
 
 soundbox-server 进程会主动连接以下外部服务：
 
 | 连接目标 | 协议 | 默认地址 | 配置项 | 数据方向 | 数据格式 |
 |---|---|---|---|---|---|
 | open-xiaoai-client（小爱音箱） | WebSocket | `ws://192.168.0.50:4399/` | `soundbox.ws_url` / `soundbox.ws_token` | 双向：上行录音 PCM；下行播放 PCM + 控制命令响应 | PCM: 1ch/16k 或 2ch/16k；JSON: 响应和事件 |
-| LLM 服务端 | TCP | `127.0.0.1:7799` | `llm.host` / `llm.port` | 双向：上行 AEC 处理后音频；下行 session_end JSON | PCM: 1ch/16k/S16；JSON: `{"type":"session_end",...}` |
-| 播放程序（LLM TTS） | TCP | `127.0.0.1:7789` | `playback.host` / `playback.port` | 单向：播放程序 → frontend 写入播放 PCM | 1ch/24k/S16 |
+| xiaozhi 音频通道 | TCP Client → Server | `127.0.0.1:7799` | `llm.host` / `llm.port` | 双向：上行 AEC 后音频；下行播放 PCM | 上行 1ch/16k/S16；下行 1ch/24k/S16 |
+| xiaozhi 命令通道 | TCP Client → Server | `127.0.0.1:7789` | `command.host` / `command.port` | 双向：session_start / session_end JSON 行 | `{"type":"session_start",...}` / `{"type":"session_end",...}` |
 
-AEC 处理后的音频通过 `AudioSink` 回调直接送给 `LlmClient` 的 TCP 连接（不经过本地 Socket）。仅在单元测试中使用 `aec_llm.sock` 将 AEC 输出写入本地 WAV 文件做 MD5 回归校验。
+AEC 处理后的音频通过 `AudioSink` 回调直接送入 xiaozhi 音频通道（不经过本地 Socket）。xiaozhi 下行播放 PCM 固定为 16bit / 24kHz / 1ch，并由 `LlmClient` 音频读取线程直接送给 SoundBox playback。
 
 ## AEC 输出路径
 
-AEC 处理后的音频（1ch / S16_LE / 16000 Hz）通过 TCP 发送给 `llm.host:llm.port` 配置的 LLM 服务端，不会写入本地 WAV 文件。LLM 服务端可自行决定是否将收到的音频留存为文件。
+AEC 处理后的音频（1ch / S16_LE / 16000 Hz）通过 xiaozhi 音频通道发送给 `llm.host:llm.port`。xiaozhi 音频通道返回的播放音频固定为 1ch / S16_LE / 24000 Hz。
 
 单元测试中，AEC 输出通过 `FileRecorder` 写入本地 WAV 文件，用于 MD5 回归校验（见下方 AEC MD5 测试一节）。测试 WAV 默认输出至项目 fixtures 目录：
 
@@ -380,12 +371,12 @@ KWS 命中时发送的 `session_start`：
 {"type":"session_start","reason":"kws_hit","score":0,"timestamp_ms":123456}
 ```
 
-LLM 服务端（通过 TCP）发送的 `session_end`：
+xiaozhi 命令通道发送的 `session_end`：
 ```json
 {"type":"session_end","reason":"vad_end","timestamp_ms":123456}
 ```
 
-frontend 仅在 kSessionStopped 状态下接受 `session_start`。在其他状态下收到的重复 `session_start` 消息会被记录日志并忽略。`session_end` 从 LLM TCP 服务端接收（而非 AEC Socket），且仅在 kSessionStarted 状态下接受。
+frontend 仅在 kSessionStopped 状态下接受 KWS 线程发来的 `session_start`。进入 kSessionStarting 后，frontend 会先通过 xiaozhi 命令通道发送 `session_start` JSON 行，再通知小爱切换到 LLM raw 模式。`session_end` 从 xiaozhi 命令通道接收（而非 AEC Socket），且仅在 kSessionStarted 状态下接受。
 
 ## AEC MD5 测试
 
@@ -420,7 +411,7 @@ ctest --output-on-failure
 
 ## Mock Soundbox 烟雾测试
 
-`audio_processing_module_tests` 会在进程内启动一个模拟的小爱 WebSocket 服务端、伪造的 KWS/AEC Unix Socket，以及一个模拟的 LLM TCP 服务端。烟雾测试验证以下完整通路：
+`audio_processing_module_tests` 会在进程内启动一个模拟的小爱 WebSocket 服务端、伪造的 KWS/AEC Unix Socket，以及模拟的 xiaozhi TCP 通道。烟雾测试验证以下完整通路：
 
 ```text
 frontend websocket 连接
@@ -430,10 +421,11 @@ frontend websocket 连接
   -> session_start
   -> llm_start
   -> AEC 录音 PCM 路由至 frontend_aec.sock
-  -> 经 AEC 处理后的音频发送至模拟 LLM TCP 服务端
-  -> 模拟 LLM TCP 服务端发送 session_end
+  -> 通过命令通道发送 session_start
+  -> 经 AEC 处理后的音频发送至模拟 xiaozhi 音频通道
+  -> 模拟 xiaozhi 命令通道发送 session_end
   -> llm_stop
-  -> 播放 PCM 通过 TCP 连接 playback 端口并以 websocket tag=play 转发
+  -> xiaozhi 音频通道下行播放 PCM 并以 websocket tag=play 转发
 ```
 
 使用常规测试命令运行：
@@ -459,11 +451,8 @@ WebSocket 连接失败（启动时报错退出）
 - URL 错误：检查 `soundbox.ws_url` 是否指向正确的音箱地址和端口，确保音箱端 `open-xiaoai-client` 已在监听模式下运行。错误信息中包含 "url error" 表示 URL 不可达或格式有误。
 - Token 错误：检查 `soundbox.ws_token` 是否与 `open-xiaoai-client -l` 输出的监听码一致。错误信息中包含 "token error" 或 HTTP 401/403 表示认证失败。
 
-LLM TCP 连接失败
-- 确认 LLM 服务端正在 `llm.host:llm.port`（默认 `127.0.0.1:7799`）上运行。LlmClient 会以 10 秒总超时时间重试 TCP 连接。
-
-播放 TCP 连接失败
-- 确认播放程序正在 `playback.host:playback.port`（默认 `127.0.0.1:7789`）上连接。播放程序连接失败时会自动重试。
+xiaozhi TCP 连接失败
+- 确认 xiaozhi 音频通道正在 `llm.host:llm.port`（默认 `127.0.0.1:7799`）上运行，命令通道正在 `command.host:command.port`（默认 `127.0.0.1:7789`）上运行。LlmClient 会以 10 秒总超时时间重试 TCP 连接。
 
 Socket 连接失败
 - 删除 `socket_dir` 目录下的残留 Socket 文件，或重启服务。服务启动时会自动清理残留的 Socket 文件。

@@ -65,12 +65,8 @@ class Frontend {
   struct Options {
     std::string kws_socket_path;       // KWS 控制/音频 Unix socket 路径
     std::string aec_socket_path;       // AEC 音频 Unix socket 路径
-    std::string playback_host;         // 播放 PCM 监听 TCP 地址（用于流式播放输出）
-    int playback_port;                 // 播放 PCM 监听 TCP 端口
     xiaoai_server::config::Config soundbox_config;  // SoundBox 客户端连接配置
     std::shared_ptr<soundbox_server::llm::LlmClient> llm_client;  // LLM 客户端实例（可为空）
-    size_t playback_read_chunk_bytes{4096};  // 播放流每次读取的缓冲区大小（字节）
-    std::function<ssize_t(int, uint8_t*, size_t)> playback_read;  // 可选的播放读取函数，默认使用 ::read
   };
 
   // 构造函数：传入 Options 初始化前端各组件，校验 socket 路径非空
@@ -81,8 +77,8 @@ class Frontend {
   // 获取当前状态（线程安全，加锁读取）
   State state() const;
 
-  // 启动前端主循环：连接 KWS/AEC socket、初始化 SoundBox 和 LLM 客户端、
-  // 启动 KWS 控制读取线程和播放接受线程，阻塞直到 Stop() 被调用
+  // 启动前端主循环：连接 KWS/AEC socket、初始化 SoundBox 和 xiaozhi 客户端、
+  // 启动 KWS 控制读取线程，阻塞直到 Stop() 被调用
   void Run();
   // 停止前端：设置停止标志、通知条件变量、断开所有 socket 连接、停止子客户端、
   // join 子线程，可安全重复调用
@@ -106,11 +102,6 @@ class Frontend {
   void OnLlmSessionEnd(const std::string& reason);
   // KWS 控制通道读取线程：循环读取 session_start 消息并分发给 HandleSessionStart
   void KwsControlReaderLoop();
-  // 播放接受线程：创建 playback TCP 监听，循环接受播放客户端连接
-  void PlaybackAcceptLoop();
-  // 播放客户端处理循环：从客户端 fd 读取 PCM 数据并写入 SoundBox 播放队列
-  // client_fd：已接受的播放客户端 socket 文件描述符
-  void PlaybackClientLoop(int client_fd);
   // 处理 session_start 消息：仅在 kSessionStopped 状态下有效
   // message：已解析的 session_start 控制消息
   // 成功后进入 kSessionStarting → kSessionStarted，失败则回到 kSessionStopped 继续等待唤醒
@@ -138,7 +129,6 @@ class Frontend {
   audio_processing_module::FileDescriptor kws_socket_;   // KWS 控制和音频 Unix socket
   audio_processing_module::FileDescriptor aec_socket_;   // AEC 音频 Unix socket
   std::thread kws_control_thread_;   // KWS 控制消息读取线程
-  std::thread playback_thread_;      // 播放接受线程
   mutable std::mutex mu_;            // 保护 state_ 和条件变量的互斥锁
   std::condition_variable stop_cv_;  // 停止条件变量，用于阻塞 Run() 主循环等待停止信号
   State state_{State::kSessionInit};  // 当前运行状态，默认为 kSessionInit 初始/重连状态

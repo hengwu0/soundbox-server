@@ -335,12 +335,9 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
          << defaults.runtime.wakeup.kws_num_trailing_blanks << "\n"
          << "  min_trigger_interval_ms: "
          << defaults.runtime.wakeup.min_trigger_interval_ms << "\n"
-<< "playback:\n"
-          << "  host: \"" << defaults.runtime.playback.host << "\"\n"
-          << "  port: " << defaults.runtime.playback.port << "\n"
-          << "  sample_rate: " << defaults.runtime.playback.sample_rate << "\n"
-          << "  channels: " << defaults.runtime.playback.channels << "\n"
-          << "  bits_per_sample: " << defaults.runtime.playback.bits_per_sample << "\n"
+         << "command:\n"
+         << "  host: \"" << defaults.runtime.command.host << "\"\n"
+         << "  port: " << defaults.runtime.command.port << "\n"
          << "llm:\n"
          << "  host: \"" << defaults.runtime.llm.host << "\"\n"
          << "  port: " << defaults.runtime.llm.port << "\n"
@@ -425,16 +422,10 @@ void ApplyConfigEntry(PipelineOptions* options,
     options->runtime.wakeup.kws_num_trailing_blanks = ParseInt(value, key);
   } else if (key == "wakeup.min_trigger_interval_ms") {
     options->runtime.wakeup.min_trigger_interval_ms = ParseInt(value, key);
-  } else if (key == "playback.host") {
-    options->runtime.playback.host = value;
-  } else if (key == "playback.port") {
-    options->runtime.playback.port = ParseInt(value, key);
-  } else if (key == "playback.sample_rate") {
-    options->runtime.playback.sample_rate = ParseInt(value, key);
-  } else if (key == "playback.channels") {
-    options->runtime.playback.channels = ParseInt(value, key);
-  } else if (key == "playback.bits_per_sample") {
-    options->runtime.playback.bits_per_sample = ParseInt(value, key);
+  } else if (key == "command.host") {
+    options->runtime.command.host = value;
+  } else if (key == "command.port") {
+    options->runtime.command.port = ParseInt(value, key);
   } else if (key == "llm.host") {
     options->runtime.llm.host = value;
   } else if (key == "llm.port") {
@@ -794,6 +785,8 @@ int RunPipeline(const PipelineOptions& options) {
       soundbox_server::llm::LlmClientOptions{
           options.runtime.llm.host,
           options.runtime.llm.port,
+          options.runtime.command.host,
+          options.runtime.command.port,
       },
       [](const std::string&) {});
   llm_client->Connect();
@@ -819,8 +812,6 @@ int RunPipeline(const PipelineOptions& options) {
   soundbox_server::frontend::Frontend::Options frontend_options;
   frontend_options.kws_socket_path = frontend_kws_socket;
   frontend_options.aec_socket_path = frontend_aec_socket;
-  frontend_options.playback_host = options.runtime.playback.host;
-  frontend_options.playback_port = options.runtime.playback.port;
   frontend_options.soundbox_config = options.runtime;
   frontend_options.llm_client = llm_client;
   soundbox_server::frontend::Frontend frontend(frontend_options);

@@ -15,16 +15,16 @@ namespace {
 // kLog 是 soundbox 连接层日志器。
 const auto kLog = xiaoai_server::GetLogger("soundbox");
 
-// 生成远端播放链路需要的默认音频参数。
+// 生成远端播放链路需要的固定音频参数：1ch/S16_LE/24kHz。
 nlohmann::json PlaybackConfigJson(const config::Config& cfg) {
-  const int buffer_frames =
-      std::max(240, cfg.xiaozhi.downlink_sample_rate * cfg.xiaozhi.opus_frame_duration_ms / 1000);
+  const int buffer_frames = std::max(240, config::kPlaybackSampleRate *
+                                             cfg.xiaozhi.opus_frame_duration_ms / 1000);
   const int period_frames = std::max(120, buffer_frames / 4);
   return nlohmann::json{
       {"pcm", "noop"},
-      {"channels", 1},
-      {"bits_per_sample", 16},
-      {"sample_rate", cfg.xiaozhi.downlink_sample_rate},
+      {"channels", config::kPlaybackChannels},
+      {"bits_per_sample", config::kPlaybackBitsPerSample},
+      {"sample_rate", config::kPlaybackSampleRate},
       {"period_size", period_frames},
       {"buffer_size", buffer_frames},
   };

@@ -12,8 +12,12 @@ inline constexpr int kFastRecordingOutputBitsPerSample = 16;
 inline constexpr int kLlmRawSampleRate = 16000;
 inline constexpr int kLlmRawChannels = 2;
 inline constexpr int kLlmRawBitsPerSample = 16;
-// xiaozhi 上行 Opus 编码前需要的固定采样率。
+// xiaozhi TCP 音频通道上行固定为 1ch/S16_LE/16kHz PCM。
 inline constexpr int kXiaozhiUploadSampleRate = 16000;
+// xiaozhi TCP 音频通道下行播放固定为 1ch/S16_LE/24kHz PCM。
+inline constexpr int kPlaybackSampleRate = 24000;
+inline constexpr int kPlaybackChannels = 1;
+inline constexpr int kPlaybackBitsPerSample = 16;
 
 // 描述本地播放链路可调参数；采集格式由 open-xiaoai-client 固定，不从配置读取。
 struct AudioPreset {
@@ -58,8 +62,6 @@ struct XiaozhiPreset {
   int ping_interval_ms{10000};
   // opus_frame_duration_ms 是本地 Opus 编码帧长，也会写入 hello 的 frame_duration。
   int opus_frame_duration_ms{60};
-  // downlink_sample_rate 是 xiaozhi 下行 Opus 解码后的播放采样率。
-  int downlink_sample_rate{24000};
 };
 
 // 描述本地 VAD 的阈值、滑动窗口和预卷参数。
@@ -114,25 +116,19 @@ struct Wakeup {
   int min_trigger_interval_ms{800};
 };
 
-// 描述本地播放设备（如 ALSA / PipeWire）开口时的 PCM 参数，以及播放 TCP 监听地址。
-struct PlaybackPreset {
-  // host 是播放 TCP 监听地址，默认本机回环地址。
+// 描述 xiaozhi 命令通道 TCP Server 的连接参数。
+struct CommandPreset {
+  // host 是 xiaozhi 命令通道 TCP Server 地址，默认本机回环地址。
   std::string host{"127.0.0.1"};
-  // port 是播放 TCP 监听端口，默认 7789。
+  // port 是 xiaozhi 命令通道 TCP Server 端口，默认 7789。
   int port{7789};
-  // sample_rate 是播放设备打开的采样率，默认 24000 Hz 与 xiaozhi 下行采样率保持一致。
-  int sample_rate{24000};
-  // channels 是播放声道数，默认单声道。
-  int channels{1};
-  // bits_per_sample 是播放位深，默认 S16_LE。
-  int bits_per_sample{16};
 };
 
-// 描述本地 LLM（大语言模型）推理服务的连接参数。
+// 描述 xiaozhi 音频通道 TCP Server 的连接参数。
 struct LlmPreset {
-  // host 是 LLM 推理服务监听的地址，默认本机回环地址。
+  // host 是 xiaozhi 音频通道 TCP Server 地址，默认本机回环地址。
   std::string host{"127.0.0.1"};
-  // port 是 LLM 推理服务监听的 TCP 端口。
+  // port 是 xiaozhi 音频通道 TCP Server 端口，默认 7799。
   int port{7799};
 };
 
@@ -176,9 +172,9 @@ struct Config {
   VadPreset vad;
   // wakeup 保存本地唤醒模型和提示语参数。
   Wakeup wakeup;
-  // playback 保存本地播放设备开口 PCM 参数。
-  PlaybackPreset playback;
-  // llm 保存本地 LLM 推理服务连接参数。
+  // command 保存 xiaozhi 命令通道 TCP Server 连接参数。
+  CommandPreset command;
+  // llm 保存 xiaozhi 音频通道 TCP Server 连接参数。
   LlmPreset llm;
   // budget 保存内部队列和重连退避预算。
   BudgetPreset budget;

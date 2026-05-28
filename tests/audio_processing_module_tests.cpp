@@ -401,58 +401,114 @@ class FakeKwsEngine final : public xiaoai_server::wakeup::IKwsEngine {
 
 class MockLlmTcpServer {
  public:
-  MockLlmTcpServer() : listen_port_(GetFreeTcpPort()) {
-    server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    Require(server_fd_ >= 0, "failed to create mock LLM TCP server socket");
-
-    int reuse = 1;
-    ::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(static_cast<uint16_t>(listen_port_));
-    Require(::bind(server_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0,
-            "failed to bind mock LLM TCP server");
-    Require(::listen(server_fd_, 1) == 0, "failed to listen mock LLM TCP server");
+  MockLlmTcpServer()
+      : audio_port_(GetFreeTcpPort()), command_port_(GetFreeTcpPort()) {
+    audio_server_fd_ = CreateServerSocket(audio_port_, "audio");
+    command_server_fd_ = CreateServerSocket(command_port_, "command");
   }
 
   ~MockLlmTcpServer() {
     Stop();
-    if (server_fd_ >= 0) ::close(server_fd_);
   }
 
-  int port() const { return listen_port_; }
+  int port() const { return audio_port_; }
+  int command_port() const { return command_port_; }
   std::string host() const { return "127.0.0.1"; }
   size_t audio_bytes_received() const { return audio_bytes_received_.load(); }
+  bool SawSessionStart() const { return saw_session_start_.load(); }
 
   void Start() {
-    accept_thread_ = std::thread([this] {
-      while (!stop_requested_.load()) {
-        pollfd pfd{};
-        pfd.fd = server_fd_;
-        pfd.events = POLLIN;
-        int ret = ::poll(&pfd, 1, 200);
-        if (ret < 0) {
-          if (errno == EINTR) continue;
-          break;
-        }
-        if (ret == 0) continue;
+    audio_thread_ = std::thread([this] { AudioLoop(); });
+    command_thread_ = std::thread([this] { CommandLoop(); });
+  }
 
-        struct sockaddr_in client_addr{};
-        socklen_t addr_len = sizeof(client_addr);
-        client_fd_ = ::accept(server_fd_, reinterpret_cast<struct sockaddr*>(&client_addr), &addr_len);
-        if (client_fd_ < 0) {
-          if (errno == EINTR) continue;
-          break;
-        }
+  void SendSessionEnd() {
+    const std::string line =
+        "{\"type\":\"session_end\",\"reason\":\"vad_end\",\"timestamp_ms\":2}\n";
+    SendCommandLine(line);
+  }
+
+  void SendPlaybackAudio(const std::vector<uint8_t>& pcm) {
+    Require(WaitUntil([this] { return audio_client_fd_.load() >= 0; }, std::chrono::seconds(5)),
+            "mock xiaozhi audio client is not connected");
+    const int fd = audio_client_fd_.load();
+    ssize_t result = ::send(fd, pcm.data(), pcm.size(), MSG_NOSIGNAL);
+    Require(result == static_cast<ssize_t>(pcm.size()),
+            "failed to send playback audio from mock xiaozhi audio channel");
+  }
+
+  void Stop() {
+    stop_requested_.store(true);
+    CloseFd(audio_server_fd_);
+    CloseFd(command_server_fd_);
+    CloseFd(audio_client_fd_);
+    CloseFd(command_client_fd_);
+    if (audio_thread_.joinable()) audio_thread_.join();
+    if (command_thread_.joinable()) command_thread_.join();
+    if (accept_error_) std::rethrow_exception(accept_error_);
+  }
+
+ private:
+  static int CreateServerSocket(int port, const char* channel) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    Require(fd >= 0, std::string("failed to create mock xiaozhi ") + channel + " server socket");
+
+    int reuse = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    Require(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0,
+            std::string("failed to bind mock xiaozhi ") + channel + " server");
+    Require(::listen(fd, 1) == 0,
+            std::string("failed to listen mock xiaozhi ") + channel + " server");
+    return fd;
+  }
+
+  static void CloseFd(std::atomic<int>& fd) {
+    const int old_fd = fd.exchange(-1);
+    if (old_fd >= 0) {
+      ::shutdown(old_fd, SHUT_RDWR);
+      ::close(old_fd);
+    }
+  }
+
+  int AcceptClient(int server_fd) {
+    while (!stop_requested_.load()) {
+      pollfd pfd{};
+      pfd.fd = server_fd;
+      pfd.events = POLLIN;
+      const int ret = ::poll(&pfd, 1, 200);
+      if (ret < 0) {
+        if (errno == EINTR) continue;
         break;
       }
-      if (client_fd_ < 0) return;
+      if (ret == 0) continue;
+
+      sockaddr_in client_addr{};
+      socklen_t addr_len = sizeof(client_addr);
+      const int client_fd =
+          ::accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+      if (client_fd < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+      return client_fd;
+    }
+    return -1;
+  }
+
+  void AudioLoop() {
+    try {
+      const int client_fd = AcceptClient(audio_server_fd_.load());
+      audio_client_fd_.store(client_fd);
+      if (client_fd < 0) return;
 
       std::array<uint8_t, 4096> buffer{};
       while (!stop_requested_.load()) {
-        const ssize_t bytes_read = ::recv(client_fd_, buffer.data(), buffer.size(), 0);
+        const ssize_t bytes_read = ::recv(client_fd, buffer.data(), buffer.size(), 0);
         if (bytes_read < 0) {
           if (errno == EINTR) continue;
           break;
@@ -460,46 +516,64 @@ class MockLlmTcpServer {
         if (bytes_read == 0) break;
         audio_bytes_received_.fetch_add(static_cast<size_t>(bytes_read));
       }
-    });
-  }
-
-  void SendSessionEnd() {
-    const std::string line =
-        "{\"type\":\"session_end\",\"reason\":\"vad_end\",\"timestamp_ms\":2}\n";
-    if (client_fd_ >= 0) {
-      ssize_t result = ::send(client_fd_, line.data(), line.size(), MSG_NOSIGNAL);
-      Require(result >= 0, "failed to send session_end from mock LLM TCP server");
+    } catch (...) {
+      accept_error_ = std::current_exception();
     }
   }
 
-  void Stop() {
-    stop_requested_.store(true);
-    if (server_fd_ >= 0) {
-      ::shutdown(server_fd_, SHUT_RDWR);
+  void CommandLoop() {
+    try {
+      const int client_fd = AcceptClient(command_server_fd_.load());
+      command_client_fd_.store(client_fd);
+      if (client_fd < 0) return;
+
+      std::string buffer;
+      std::array<char, 1024> chunk{};
+      while (!stop_requested_.load()) {
+        const ssize_t bytes_read = ::recv(client_fd, chunk.data(), chunk.size(), 0);
+        if (bytes_read < 0) {
+          if (errno == EINTR) continue;
+          break;
+        }
+        if (bytes_read == 0) break;
+        buffer.append(chunk.data(), static_cast<size_t>(bytes_read));
+        size_t newline = std::string::npos;
+        while ((newline = buffer.find('\n')) != std::string::npos) {
+          const std::string line = buffer.substr(0, newline);
+          buffer.erase(0, newline + 1);
+          const auto message = nlohmann::json::parse(line, nullptr, false);
+          if (!message.is_discarded() && message.value("type", "") == "session_start") {
+            saw_session_start_.store(true);
+          }
+        }
+      }
+    } catch (...) {
+      accept_error_ = std::current_exception();
     }
-    if (client_fd_ >= 0) {
-      ::shutdown(client_fd_, SHUT_RDWR);
-      ::close(client_fd_);
-      client_fd_ = -1;
-    }
-    if (accept_thread_.joinable()) accept_thread_.join();
-    if (server_fd_ >= 0) {
-      ::close(server_fd_);
-      server_fd_ = -1;
-    }
-    if (accept_error_) std::rethrow_exception(accept_error_);
   }
 
- private:
-  int listen_port_;
-  int server_fd_{-1};
-  int client_fd_{-1};
+  void SendCommandLine(const std::string& line) {
+    Require(WaitUntil([this] { return command_client_fd_.load() >= 0; }, std::chrono::seconds(5)),
+            "mock xiaozhi command client is not connected");
+    const int fd = command_client_fd_.load();
+    const ssize_t result = ::send(fd, line.data(), line.size(), MSG_NOSIGNAL);
+    Require(result == static_cast<ssize_t>(line.size()),
+            "failed to send command line from mock xiaozhi command channel");
+  }
+
+  int audio_port_;
+  int command_port_;
+  std::atomic<int> audio_server_fd_{-1};
+  std::atomic<int> command_server_fd_{-1};
+  std::atomic<int> audio_client_fd_{-1};
+  std::atomic<int> command_client_fd_{-1};
   std::atomic<bool> stop_requested_{false};
   std::atomic<size_t> audio_bytes_received_{0};
-  std::thread accept_thread_;
+  std::atomic<bool> saw_session_start_{false};
+  std::thread audio_thread_;
+  std::thread command_thread_;
   std::exception_ptr accept_error_;
 };
-
 }  // namespace
 
 // 测试 2ch/16bit PCM 数据被稳定拆成 mic 和 ref 两路单声道。
@@ -696,7 +770,7 @@ static void TestLlmClientConnectsToTcpServerAndReceivesSessionEnd() {
   std::atomic<bool> session_end_received{false};
   std::string session_end_reason;
 
-  LlmClient client(LlmClientOptions{mock_server.host(), mock_server.port()},
+  LlmClient client(LlmClientOptions{mock_server.host(), mock_server.port(), mock_server.host(), mock_server.command_port()},
                    [&](const std::string& reason) {
                      session_end_received.store(true);
                      session_end_reason = reason;
@@ -918,8 +992,6 @@ static void TestFrontendControlSocketDisconnectsReconnect() {
   const std::filesystem::path temp_root = MakeTempDirectory("frontend_control_fault");
   const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
   const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
-  const int playback_port = GetFreeTcpPort();
-
   MockSoundboxWebSocketServer mock_soundbox;
   MockLlmTcpServer mock_llm;
   mock_llm.Start();
@@ -963,16 +1035,14 @@ static void TestFrontendControlSocketDisconnectsReconnect() {
     } catch (...) {}
   });
 
-Frontend::Options options;
+  Frontend::Options options;
   options.kws_socket_path = kws_socket;
   options.aec_socket_path = aec_socket;
-  options.playback_host = "127.0.0.1";
-  options.playback_port = playback_port;
   options.soundbox_config.soundbox.ws_url = mock_soundbox.url();
   options.soundbox_config.soundbox.ws_token = "mock-token";
   options.soundbox_config.soundbox.connect_timeout_ms = 3000;
   options.llm_client = std::make_shared<LlmClient>(
-      LlmClientOptions{mock_llm.host(), mock_llm.port()}, [](const std::string&) {});
+      LlmClientOptions{mock_llm.host(), mock_llm.port(), mock_llm.host(), mock_llm.command_port()}, [](const std::string&) {});
 
   Frontend frontend(options);
   std::exception_ptr frontend_error;
@@ -1017,16 +1087,20 @@ Frontend::Options options;
   if (kws_error) std::rethrow_exception(kws_error);
 }
 
-// 测试前端播放读错误后仍能继续接受新客户端连接。
-static void TestFrontendPlaybackReadErrorKeepsAcceptingClients() {
-  const std::filesystem::path temp_root = MakeTempDirectory("frontend_playback_recover");
+// 测试 xiaozhi 音频通道下行 PCM 会被转发为 SoundBox tag=play 播放包。
+static void TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay() {
+  const std::filesystem::path temp_root = MakeTempDirectory("frontend_xiaozhi_downlink");
   const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
   const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
-  const int playback_port = GetFreeTcpPort();
 
   MockSoundboxWebSocketServer mock_soundbox;
   MockLlmTcpServer mock_llm;
   mock_llm.Start();
+  auto shared_llm = std::make_shared<LlmClient>(
+      LlmClientOptions{mock_llm.host(), mock_llm.port(), mock_llm.host(),
+                       mock_llm.command_port()},
+      [](const std::string&) {});
+  shared_llm->Connect();
 
   std::atomic<bool> stop_servers{false};
   std::exception_ptr kws_error;
@@ -1057,25 +1131,13 @@ static void TestFrontendPlaybackReadErrorKeepsAcceptingClients() {
     } catch (...) {}
   });
 
-  std::atomic<bool> fail_next_playback_read{true};
   Frontend::Options options;
   options.kws_socket_path = kws_socket;
   options.aec_socket_path = aec_socket;
-  options.playback_host = "127.0.0.1";
-  options.playback_port = playback_port;
   options.soundbox_config.soundbox.ws_url = mock_soundbox.url();
   options.soundbox_config.soundbox.ws_token = "mock-token";
   options.soundbox_config.soundbox.connect_timeout_ms = 3000;
-  options.llm_client = std::make_shared<LlmClient>(
-      LlmClientOptions{mock_llm.host(), mock_llm.port()}, [](const std::string&) {});
-  options.playback_read_chunk_bytes = 320;
-  options.playback_read = [&](int fd, uint8_t* data, size_t size) -> ssize_t {
-    if (fail_next_playback_read.exchange(false)) {
-      errno = EIO;
-      return -1;
-    }
-    return ::read(fd, data, size);
-  };
+  options.llm_client = shared_llm;
 
   Frontend frontend(options);
   std::exception_ptr frontend_error;
@@ -1089,19 +1151,10 @@ static void TestFrontendPlaybackReadErrorKeepsAcceptingClients() {
                       std::chrono::seconds(5)),
             "frontend should finish soundbox startup");
 
-    auto failing_client = audio_processing_module::ConnectTcpWithRetry(
-        "127.0.0.1", playback_port, std::chrono::seconds(5), std::chrono::milliseconds(20));
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    failing_client.reset();
-
-    auto playback_client = audio_processing_module::ConnectTcpWithRetry(
-        "127.0.0.1", playback_port, std::chrono::seconds(5), std::chrono::milliseconds(20));
     const std::vector<uint8_t> playback_pcm(320, 0x44);
-    audio_processing_module::WriteAll(playback_client.get(), playback_pcm.data(),
-                                       playback_pcm.size());
-    playback_client.reset();
+    mock_llm.SendPlaybackAudio(playback_pcm);
     Require(WaitUntil([&] { return mock_soundbox.SawPlayPacket(); }, std::chrono::seconds(5)),
-            "playback thread should accept a second client after a read error");
+            "xiaozhi downlink PCM should be forwarded as websocket tag=play packet");
   } catch (...) {
     frontend.Stop();
     stop_servers.store(true);
@@ -1127,14 +1180,12 @@ static void TestFrontendMockSoundboxSmokeLoop() {
   const std::filesystem::path temp_root = MakeTempDirectory("frontend_smoke");
   const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
   const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
-  const int playback_port = GetFreeTcpPort();
-
   MockSoundboxWebSocketServer mock_soundbox;
   MockLlmTcpServer mock_llm;
   mock_llm.Start();
 
   auto shared_llm = std::make_shared<LlmClient>(
-      LlmClientOptions{mock_llm.host(), mock_llm.port()}, [](const std::string&) {});
+      LlmClientOptions{mock_llm.host(), mock_llm.port(), mock_llm.host(), mock_llm.command_port()}, [](const std::string&) {});
   shared_llm->Connect();
 
   std::exception_ptr kws_error;
@@ -1178,13 +1229,10 @@ static void TestFrontendMockSoundboxSmokeLoop() {
   Frontend::Options options;
   options.kws_socket_path = kws_socket;
   options.aec_socket_path = aec_socket;
-  options.playback_host = "127.0.0.1";
-  options.playback_port = playback_port;
   options.soundbox_config.soundbox.ws_url = mock_soundbox.url();
   options.soundbox_config.soundbox.ws_token = "mock-token";
   options.soundbox_config.soundbox.connect_timeout_ms = 3000;
   options.llm_client = shared_llm;
-  options.playback_read_chunk_bytes = 320;
 
   Frontend frontend(options);
   std::exception_ptr frontend_error;
@@ -1230,14 +1278,13 @@ static void TestFrontendMockSoundboxSmokeLoop() {
                       std::chrono::seconds(5)),
             "llm_stop_ok should return frontend to SessionEnd or reconnect");
 
-    auto playback_client = audio_processing_module::ConnectTcpWithRetry(
-        "127.0.0.1", playback_port, std::chrono::seconds(5), std::chrono::milliseconds(20));
+    Require(WaitUntil([&] { return mock_llm.SawSessionStart(); }, std::chrono::seconds(5)),
+            "kws hit should send session_start to xiaozhi command channel");
+
     const std::vector<uint8_t> playback_pcm(320, 0x33);
-    audio_processing_module::WriteAll(playback_client.get(), playback_pcm.data(),
-                                      playback_pcm.size());
-    playback_client.reset();
+    mock_llm.SendPlaybackAudio(playback_pcm);
     Require(WaitUntil([&] { return mock_soundbox.SawPlayPacket(); }, std::chrono::seconds(5)),
-            "playback socket PCM should be forwarded as websocket tag=play packet");
+            "xiaozhi downlink PCM should be forwarded as websocket tag=play packet");
   } catch (...) {
     frontend.Stop();
     keep_control_open.store(false);
@@ -1390,31 +1437,28 @@ static void TestParseOptionsLoadsSoundboxControlTimeouts() {
           "llm_stop timeout should be loaded from config");
 }
 
-// 测试 ParseOptions 加载播放和 LLM 配置项。
-static void TestParseOptionsLoadsPlaybackAndLlmConfig() {
-  const std::filesystem::path temp_root = MakeTempDirectory("playback_llm_config");
+// 测试 ParseOptions 加载 xiaozhi 命令通道和音频通道配置项。
+static void TestParseOptionsLoadsCommandAndLlmConfig() {
+  const std::filesystem::path temp_root = MakeTempDirectory("command_llm_config");
   const std::filesystem::path config_file = temp_root / "apm.yaml";
   WriteConfigFile(config_file,
                   "socket_dir: \"" + (temp_root / "sockets").string() + "\"\n"
                   "soundbox:\n"
                   "  ws_url: \"ws://127.0.0.1:9/\"\n"
                   "  ws_token: \"mock-token\"\n"
-                  "playback:\n"
-                  "  sample_rate: 44100\n"
-                  "  channels: 2\n"
-                  "  bits_per_sample: 24\n"
+                  "command:\n"
+                  "  host: \"10.0.0.2\"\n"
+                  "  port: 7788\n"
                   "llm:\n"
                   "  host: \"10.0.0.1\"\n"
                   "  port: 9876\n");
 
   const auto options = ParseOptions({"soundbox-server", "--config", config_file.string()});
 
-  Require(options.runtime.playback.sample_rate == 44100,
-          "playback sample_rate should be loaded from config");
-  Require(options.runtime.playback.channels == 2,
-          "playback channels should be loaded from config");
-  Require(options.runtime.playback.bits_per_sample == 24,
-          "playback bits_per_sample should be loaded from config");
+  Require(options.runtime.command.host == "10.0.0.2",
+          "command host should be loaded from config");
+  Require(options.runtime.command.port == 7788,
+          "command port should be loaded from config");
   Require(options.runtime.llm.host == "10.0.0.1",
           "llm host should be loaded from config");
   Require(options.runtime.llm.port == 9876,
@@ -1593,8 +1637,8 @@ int main() {
     TestFrontendControlMessageParserRequiresTypedJsonFields();
     std::cerr << "[ RUN      ] TestFrontendControlSocketDisconnectsReconnect\n";
     TestFrontendControlSocketDisconnectsReconnect();
-    std::cerr << "[ RUN      ] TestFrontendPlaybackReadErrorKeepsAcceptingClients\n";
-    TestFrontendPlaybackReadErrorKeepsAcceptingClients();
+    std::cerr << "[ RUN      ] TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay\n";
+    TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay();
     std::cerr << "[ RUN      ] TestFrontendMockSoundboxSmokeLoop\n";
     TestFrontendMockSoundboxSmokeLoop();
     std::cerr << "[ RUN      ] TestWavWriterPatchesHeaderAfterStreamingSamples\n";
@@ -1607,8 +1651,8 @@ int main() {
     TestParseOptionsRejectsRemovedTuningFlags();
     std::cerr << "[ RUN      ] TestParseOptionsLoadsSoundboxControlTimeouts\n";
     TestParseOptionsLoadsSoundboxControlTimeouts();
-    std::cerr << "[ RUN      ] TestParseOptionsLoadsPlaybackAndLlmConfig\n";
-    TestParseOptionsLoadsPlaybackAndLlmConfig();
+    std::cerr << "[ RUN      ] TestParseOptionsLoadsCommandAndLlmConfig\n";
+    TestParseOptionsLoadsCommandAndLlmConfig();
     std::cerr << "[ RUN      ] TestRunPipelineRejectsMissingSoundboxUrl\n";
     TestRunPipelineRejectsMissingSoundboxUrl();
     std::cerr << "[ RUN      ] TestRunPipelineRejectsMissingSoundboxToken\n";

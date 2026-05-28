@@ -20,8 +20,6 @@ namespace {
 constexpr auto kSocketConnectTimeout = std::chrono::seconds(10);
 // Unix socket 连接重试间隔（毫秒）
 constexpr auto kSocketRetryInterval = std::chrono::milliseconds(20);
-// 播放 accept 轮询超时时间（毫秒），使 accept 循环可响应 stop_requested_
-constexpr auto kAcceptPollTimeout = std::chrono::milliseconds(200);
 
 // 前端全局日志记录器
 const auto kLog = xiaoai_server::GetLogger("frontend");
@@ -201,16 +199,12 @@ ControlMessage ParseControlMessageLine(const std::string& line,
   return parsed;
 }
 
-// 前端构造函数：存储选项并校验必填 socket 路径和 playback 地址非空
+// 前端构造函数：存储选项并校验必填 Unix socket 路径非空
 // options：前端初始化选项
-// 异常：任一 socket 路径或 playback 地址为空时抛出 std::runtime_error
+// 异常：任一 socket 路径为空时抛出 std::runtime_error
 Frontend::Frontend(Options options) : options_(std::move(options)) {
-  if (options_.kws_socket_path.empty() || options_.aec_socket_path.empty() ||
-      options_.playback_host.empty()) {
-    throw std::runtime_error("frontend socket paths and playback host must not be empty");
-  }
-  if (options_.playback_port <= 0) {
-    throw std::runtime_error("frontend playback port must be positive");
+  if (options_.kws_socket_path.empty() || options_.aec_socket_path.empty()) {
+    throw std::runtime_error("frontend socket paths must not be empty");
   }
   // state_ 保持默认值 kSessionInit，表示初始/重连状态
 }
@@ -231,9 +225,9 @@ Frontend::State Frontend::state() const {
 // 1. 重置停止标志
 // 2. 进入 kSessionStopped 状态（空闲状态，等待唤醒）
 // 3. 连接 KWS 和 AEC Unix socket
-// 4. 注册 LLM 客户端的 session_stop 回调
+// 4. 注册 xiaozhi 客户端的 session_end / 下行播放 PCM 回调
 // 5. 初始化 SoundBox 客户端并注册音频回调
-// 6. 启动 KWS 控制读取线程和播放接受线程
+// 6. 启动 KWS 控制读取线程
 // 7. 启动 SoundBox 客户端
 // 8. 阻塞等待停止信号
 // 异常：SoundBox 启动失败时抛出 std::runtime_error
@@ -250,11 +244,16 @@ void Frontend::Run() {
   aec_socket_ = audio_processing_module::ConnectUnixSocketWithRetry(
       options_.aec_socket_path, kSocketConnectTimeout, kSocketRetryInterval);
 
-  // 注册 LLM 客户端会话停止回调：当 VAD 检测到静音超时或其他原因结束时触发
+  // 注册 xiaozhi 客户端回调：命令通道 session_end 触发会话停止；音频通道下行 PCM 直接播放。
   if (options_.llm_client) {
     llm_client_ = options_.llm_client;
     llm_client_->set_session_end_callback(
         [this](const std::string& reason) { OnLlmSessionEnd(reason); });
+    llm_client_->set_playback_audio_callback([this](const std::vector<uint8_t>& chunk) {
+      if (client_ && !client_->PlayPcm(chunk)) {
+        kLog->warn("PlayPcm failed xiaozhi_downlink_bytes={}", chunk.size());
+      }
+    });
   }
 
   // 配置 SoundBox 客户端回调：
@@ -277,8 +276,6 @@ void Frontend::Run() {
 
   // 启动 KWS 控制消息读取线程：循环等待 session_start
   kws_control_thread_ = std::thread([this] { KwsControlReaderLoop(); });
-  // 启动播放接受线程：创建 playback TCP 监听并接受播放客户端
-  playback_thread_ = std::thread([this] { PlaybackAcceptLoop(); });
 
   // 启动 SoundBox 客户端，连接到 SoundBox 服务器
   if (!client_->Start()) {
@@ -307,7 +304,7 @@ void Frontend::Stop() {
   if (client_) {
     client_->Stop();
   }
-  // 断开 LLM 客户端连接
+  // 断开 xiaozhi TCP 客户端连接
   if (llm_client_) {
     llm_client_->Disconnect();
   }
@@ -327,9 +324,6 @@ void Frontend::Stop() {
   if (kws_control_thread_.joinable() &&
       kws_control_thread_.get_id() != current_thread) {
     kws_control_thread_.join();
-  }
-  if (playback_thread_.joinable() && playback_thread_.get_id() != current_thread) {
-    playback_thread_.join();
   }
 }
 
@@ -355,16 +349,16 @@ void Frontend::OnAecAudio(const std::vector<uint8_t>& chunk) {
   audio_processing_module::WriteAll(aec_socket_.get(), chunk.data(), chunk.size());
 }
 
-// AEC 处理后音频回调：将回声消除后的 PCM 数据发送给 LLM 客户端
+// AEC 处理后音频回调：将回声消除后的 PCM 数据发送给 xiaozhi 客户端
 // processed_pcm：回声消除处理后的音频数据
-// 仅在 LLM 客户端已连接时发送，未连接时丢弃
+// 仅在 xiaozhi 客户端已连接时发送，未连接时丢弃
 void Frontend::OnAecProcessedAudio(const std::vector<uint8_t>& processed_pcm) {
   if (llm_client_ && llm_client_->connected()) {
     llm_client_->SendAudio(processed_pcm);
   }
 }
 
-// LLM 会话停止回调：由 LLM 客户端在会话结束时调用（如 VAD 静音超时）
+// xiaozhi 会话停止回调：由 xiaozhi 客户端在会话结束时调用（如 VAD 静音超时）
 // reason：会话停止原因字符串
 // 转发给 HandleSessionStop 执行状态转换，仅在 kSessionStarted 状态时有效
 void Frontend::OnLlmSessionEnd(const std::string& reason) {
@@ -398,80 +392,8 @@ void Frontend::KwsControlReaderLoop() {
   }
 }
 
-// 播放接受线程主循环：
-// 创建 playback TCP 服务器并循环接受播放客户端连接。
-// 每次只保持一个活跃播放客户端；客户端断开后等待下一个连接。
-// 使用带超时的 accept 以响应 stop_requested_ 标志。
-void Frontend::PlaybackAcceptLoop() {
-  // 创建 TCP 服务器并绑定到 playback_host:playback_port
-  audio_processing_module::FileDescriptor server =
-      audio_processing_module::CreateTcpServerSocket(
-          options_.playback_host, options_.playback_port, 1);
-  kLog->info("playback listen ready {}:{}", options_.playback_host, options_.playback_port);
-
-  while (!IsStopping()) {
-    try {
-      // 单客户端 listen：每次只接一个 playback writer，断开后重新 accept
-      audio_processing_module::FileDescriptor client =
-          audio_processing_module::AcceptTcpClientWithTimeout(server.get(),
-                                                              kAcceptPollTimeout);
-      try {
-        // 进入客户端读取循环：读取 PCM 数据并写入 SoundBox 播放队列
-        PlaybackClientLoop(client.get());
-      } catch (const std::runtime_error& error) {
-        // 客户端断开或读取失败，等待下一个播放客户端连接
-        if (IsStopping()) {
-          break;
-        }
-        kLog->warn("playback client failed: {}; waiting for next client",
-                    error.what());
-      }
-    } catch (const std::runtime_error& error) {
-      if (IsStopping()) {
-        break;  // 停止时 accept 超时是预期行为，正常退出
-      }
-      if (std::string(error.what()).find("timed out waiting") !=
-          std::string::npos) {
-        continue;  // accept 超时，继续循环检查 stop_requested_
-      }
-      throw;  // 其他异常向上传播
-    }
-  }
-}
-
-// 播放客户端处理循环：从客户端 fd 循环读取 PCM 数据块并调用 SoundBox
-// 客户端的 PlayPcm() 方法输出。
-// client_fd：播放客户端 socket 文件描述符
-// 使用 options_.playback_read 自定义读取函数（如果有）或默认 ::read。
-void Frontend::PlaybackClientLoop(int client_fd) {
-  // 预分配读取缓冲区
-  std::vector<uint8_t> buffer(options_.playback_read_chunk_bytes);
-  while (!IsStopping()) {
-    // 使用自定义读取函数或默认 ::read 系统调用
-    const ssize_t bytes_read = options_.playback_read
-                                    ? options_.playback_read(client_fd, buffer.data(),
-                                                             buffer.size())
-                                    : ::read(client_fd, buffer.data(), buffer.size());
-    if (bytes_read < 0) {
-      if (errno == EINTR) {
-        continue;  // 被信号中断，重试读取
-      }
-      throw std::runtime_error(std::string("read playback pcm: ") +
-                               std::strerror(errno));
-    }
-    if (bytes_read == 0) {
-      break;  // 对端关闭连接，退出读取循环
-    }
-    // 拷贝实际读取的数据块到 chunk 并写入播放队列
-    std::vector<uint8_t> chunk(buffer.begin(), buffer.begin() + bytes_read);
-    if (client_ && !client_->PlayPcm(chunk)) {
-      kLog->warn("PlayPcm failed playback_chunk_bytes={}", bytes_read);
-    }
-  }
-}
-
 // 处理 session_start 消息：仅在 kSessionStopped 状态下有效，表示唤醒词命中，
-// 需要启动 LLM 会话。调用 SoundBox NotifyLlmStart() 通知下游启动 LLM 通道。
+// 需要启动 xiaozhi 会话。调用 SoundBox NotifyLlmStart() 通知下游启动 LLM raw 通道。
 // message：已解析的 session_start 控制消息，reason 为 "kws_hit"
 // 成功后进入 kSessionStarted 状态开始 AEC 处理，失败则回到 kSessionStopped 继续等待下一次唤醒。
 void Frontend::HandleSessionStart(const ControlMessage& message) {
@@ -482,18 +404,24 @@ void Frontend::HandleSessionStart(const ControlMessage& message) {
   // 进入会话启动中状态
   SetState(State::kSessionStarting,
            message.reason.empty() ? "session_start" : message.reason.c_str());
-  // 通知 SoundBox 启用 LLM 通道
+  // 按 xiaozhi 命令通道协议发送 session_start JSON line。
+  if (!llm_client_ || !llm_client_->SendSessionStart(message.reason, message.score,
+                                                     message.timestamp_ms)) {
+    SetState(State::kSessionStopped, "xiaozhi_session_start_failed");
+    return;
+  }
+  // 通知 SoundBox 启用 LLM raw 通道
   if (client_ && client_->NotifyLlmStart()) {
-    // LLM 通道启用成功：进入会话进行中状态，开始 AEC 处理和音频转发
+    // LLM raw 通道启用成功：进入会话进行中状态，开始 AEC 处理和音频转发
     SetState(State::kSessionStarted, "llm_start_ok");
     return;
   }
-  // LLM 通道启用失败：回到空闲状态继续等待下一次唤醒
+  // LLM raw 通道启用失败：回到空闲状态继续等待下一次唤醒
   SetState(State::kSessionStopped, "llm_start_failed");
 }
 
-// 处理 session_stop 消息：仅在 kSessionStarted 状态下有效，表示当前 LLM 会话已结束
-//（如 VAD 静音超时或显式结束）。通知 SoundBox 停止 LLM 通道，
+// 处理 session_stop 消息：仅在 kSessionStarted 状态下有效，表示当前 xiaozhi 会话已结束
+//（如 VAD 静音超时或显式结束）。通知 SoundBox 停止 LLM raw 通道，
 // 最终回到 kSessionStopped 状态继续等待下一次唤醒。
 // reason：session 停止原因字符串
 // 成功后：kSessionStopping → kSessionStopped（回到空闲状态，等待下一次唤醒）
@@ -507,13 +435,13 @@ void Frontend::HandleSessionStop(const std::string& reason) {
   // 进入会话停止中状态
   SetState(State::kSessionStopping,
            reason.empty() ? "session_stop" : reason.c_str());
-  // 通知 SoundBox 停止 LLM 通道
+  // 通知 SoundBox 停止 LLM raw 通道
   if (client_ && client_->NotifyLlmStop()) {
-    // LLM 通道停止成功：回到空闲状态，继续等待下一次唤醒
+    // LLM raw 通道停止成功：回到空闲状态，继续等待下一次唤醒
     SetState(State::kSessionStopped, "llm_stop_ok");
     return;
   }
-  // LLM 通道停止失败：仍回到空闲状态，需重连 ws 音频链路
+  // LLM raw 通道停止失败：仍回到空闲状态，需重连 ws 音频链路
   kLog->warn("llm_stop failed after session_stop; reconnecting soundbox audio link");
   EnterSessionInitAndRestart("llm_stop_failed");
 }
