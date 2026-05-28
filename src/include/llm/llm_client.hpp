@@ -35,6 +35,7 @@ struct LlmClientOptions {
  * - SendAudio() 将 AEC 后的 1ch/S16_LE/16kHz PCM 写入音频通道；
  * - AudioReaderLoop() 从音频通道读取 1ch/S16_LE/24kHz PCM 并回调给 playback；
  * - SendSessionStart() 将 KWS 命中的 session_start JSON line 写入命令通道；
+ * - SendSessionEnd() 将本地中断产生的 session_end JSON line 写入命令通道；
  * - CommandReaderLoop() 从命令通道读取 session_end JSON line 并通知上层状态机。
  */
 class LlmClient {
@@ -89,6 +90,14 @@ class LlmClient {
   bool SendSessionStart(const std::string& reason,
                         std::optional<double> score = std::nullopt,
                         std::optional<int64_t> timestamp_ms = std::nullopt);
+
+  /**
+   * @brief 发送 session_end JSON line 到 xiaozhi 命令通道
+   * @param reason 结束原因，soundbox 原生 KWS 打断时为 soundbox_native_kws
+   * @param source 结束来源，soundbox 原生 KWS 打断时为 soundbox
+   * @return 发送成功返回 true，未连接或写入失败返回 false
+   */
+  bool SendSessionEnd(const std::string& reason, const std::string& source);
 
   /** @brief 设置会话结束回调函数 */
   void set_session_end_callback(OnSessionEndCallback callback);

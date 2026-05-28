@@ -310,6 +310,35 @@ bool LlmClient::SendSessionStart(const std::string& reason,
   return true;
 }
 
+
+bool LlmClient::SendSessionEnd(const std::string& reason, const std::string& source) {
+  nlohmann::json message = {
+      {"type", "session_end"},
+      {"reason", reason.empty() ? "session_end" : reason},
+      {"source", source.empty() ? "soundbox-server" : source},
+  };
+  std::string line = message.dump();
+  line.push_back('\n');
+
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lock(command_mu_);
+    if (!connected_.load() || command_fd_ < 0) {
+      kLog->warn("drop session_end because xiaozhi command channel is not connected");
+      return false;
+    }
+    ok = SendAllLocked(command_fd_, reinterpret_cast<const uint8_t*>(line.data()), line.size(),
+                       "command");
+  }
+  if (!ok) {
+    Disconnect();
+    return false;
+  }
+  kLog->info("sent session_end to xiaozhi reason={} source={}",
+             message.value("reason", ""), message.value("source", ""));
+  return true;
+}
+
 void LlmClient::set_session_end_callback(OnSessionEndCallback callback) {
   std::lock_guard<std::mutex> lock(callback_mu_);
   on_session_end_ = std::move(callback);

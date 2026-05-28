@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #include "common/log.hpp"
 #include "frontend/soundbox/client_internal.hpp"
@@ -124,6 +126,8 @@ SoundBoxClient::SoundBoxClient(config::Config cfg, Callbacks callbacks)
   };
   audio_router_ =
       std::make_unique<AudioRouter>(audio_pipe_, mode_controller_, std::move(router_callbacks));
+  event_dispatcher_.set_soundbox_native_kws_callback(
+      [this] { DispatchSoundboxNativeKwsCallback(); });
 }
 
 // 析构客户端并停止连接。
@@ -608,6 +612,32 @@ bool SoundBoxClient::SendBinary(const std::vector<uint8_t>& payload) {
   const auto res = ws_->sendBinary(text);
   kLog->debug("{}", internal::SoundboxAudioDebugLog("[SOUNDBOX][SEND_AUDIO]", text));
   return res.success;
+}
+
+// 异步分发 soundbox 原生 KWS 事件。
+void SoundBoxClient::DispatchSoundboxNativeKwsCallback() {
+  if (!callbacks_.on_soundbox_native_kws) {
+    return;
+  }
+
+  auto running = native_kws_callback_running_;
+  bool expected = false;
+  if (!running->compare_exchange_strong(expected, true)) {
+    kLog->debug("skip duplicate soundbox native KWS callback while previous one is running");
+    return;
+  }
+
+  auto callback = callbacks_.on_soundbox_native_kws;
+  std::thread([running, callback = std::move(callback)] {
+    try {
+      callback();
+    } catch (const std::exception& error) {
+      kLog->warn("soundbox native KWS callback failed: {}", error.what());
+    } catch (...) {
+      kLog->warn("soundbox native KWS callback failed with unknown error");
+    }
+    running->store(false);
+  }).detach();
 }
 
 // 统一处理 WebSocket message 帧。

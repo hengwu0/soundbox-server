@@ -112,32 +112,36 @@ flowchart TD
 
 ```mermaid
 stateDiagram-v2
-    [*] --> kSessionStopped : startup
+    [*] --> kSessionInit : startup
+    kSessionInit --> kSessionStopped : frontend_ready / reconnect_ok
     kSessionStopped --> kSessionStarting : session_start (kws_hit)
     kSessionStarting --> kSessionStarted : llm_start_ok
     kSessionStarting --> kSessionStopped : llm_start_failed / timeout (回退)
     kSessionStarted --> kSessionStopping : session_stop (vad_end 等)
+    kSessionStarted --> kSessionStopping : soundbox_native_kws interrupt
     kSessionStopping --> kSessionStopped : llm_stop_ok
-    kSessionStopping --> kSessionStopped : llm_stop_failed (需重连ws音频链路)
+    kSessionStopping --> kSessionInit : llm_stop_failed (重连ws音频链路)
     kSessionStarting --> kSessionInit : 超时 / 失败 (重连)
-    kSessionStopping --> kSessionInit : 超时 / 失败 (重连)
     kSessionStopped --> kSessionInit : KWS socket 断开 / WS 断开 (重连)
     kSessionStarted --> kSessionInit : WS 断开 (重连)
-    kSessionInit --> kSessionStopped : 重连成功
     kSessionInit --> [*] : 重连失败 进程退出
 ```
+
+Frontend 状态机采用单线程事件队列串行流转：KWS 控制线程、xiaozhi 命令线程、SoundBox WS 回调线程都只投递控制事件，不直接修改 `state_`。高频音频数据不进入事件队列，只读取由状态机设置的 atomic 门控开关。
 
 状态转换规则：
 
 | 当前状态 | 事件 | 目标状态 | 说明 |
 |---------|------|---------|------|
-| kSessionStopped | startup | kSessionStopped | Frontend 启动进入空闲状态 |
+| kSessionInit | frontend_ready / reconnect_ok | kSessionStopped | SoundBox 链路与本地 socket 就绪，进入空闲状态 |
 | kSessionStopped | session_start (kws_hit) | kSessionStarting | KWS 唤醒命中 |
 | kSessionStarting | xiaozhi session_start 已发送且 llm_start_ok | kSessionStarted | xiaozhi 会话启动，SoundBox 切换到 LLM raw 模式成功 |
+| kSessionStarting | soundbox_native_kws | 队列中等待 | 状态机正在处理启动事件，不插队；启动完成进入 kSessionStarted 后再处理该事件并立刻停止 |
 | kSessionStarting | llm_start_failed/timeout | kSessionStopped | 切换失败，回退等待下一次唤醒 |
 | kSessionStarted | session_stop (vad_end) | kSessionStopping | xiaozhi 会话结束 |
+| kSessionStarted | soundbox_native_kws | kSessionStopping | SoundBox 原生 KWS 打断当前会话，向 xiaozhi 发送 {"type":"session_end","reason":"soundbox_native_kws","source":"soundbox"} 后触发本地 session_stop |
 | kSessionStopping | llm_stop_ok | kSessionStopped | SoundBox 切回 KWS 模式成功 |
-| kSessionStopping | llm_stop_failed | kSessionStopped | 停止失败仍回到空闲，需重连ws音频链路 |
+| kSessionStopping | llm_stop_failed | kSessionInit | 停止失败进入重连流程 |
 | 任意 | AEC/KWS socket 断开 / WS 断开 | kSessionInit | 重连ws音频链路 |
 
 ## SoundBox 音频路由状态机 (AudioMode)
@@ -376,7 +380,7 @@ xiaozhi 命令通道发送的 `session_end`：
 {"type":"session_end","reason":"vad_end","timestamp_ms":123456}
 ```
 
-frontend 仅在 kSessionStopped 状态下接受 KWS 线程发来的 `session_start`。进入 kSessionStarting 后，frontend 会先通过 xiaozhi 命令通道发送 `session_start` JSON 行，再通知小爱切换到 LLM raw 模式。`session_end` 从 xiaozhi 命令通道接收（而非 AEC Socket），且仅在 kSessionStarted 状态下接受。
+frontend 的控制面事件统一进入单线程队列串行处理，因此 `session_start`、`session_end`、SoundBox 原生 KWS、WS 断开等事件不会并发修改状态。frontend 仅在 kSessionStopped 状态下接受 KWS 线程发来的 `session_start`。进入 kSessionStarting 后，frontend 会先通过 xiaozhi 命令通道发送 `session_start` JSON 行，再通知小爱切换到 LLM raw 模式。`session_end` 从 xiaozhi 命令通道接收（而非 AEC Socket），且仅在 kSessionStarted 状态下接受。若 SoundBox 原生 KWS 在启动流程中到达，它会排队等待；启动进入 kSessionStarted 后再作为打断事件处理。
 
 ## AEC MD5 测试
 

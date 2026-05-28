@@ -331,6 +331,25 @@ class MockSoundboxWebSocketServer {
     }
   }
 
+  void SendNativeKwsEvent() {
+    nlohmann::json instruction_line = {
+        {"header", {{"namespace", "SpeechRecognizer"}, {"name", "RecognizeResult"}}},
+        {"payload",
+         {{"is_vad_begin", false},
+          {"is_final", false},
+          {"results", nlohmann::json::array()}}},
+    };
+    nlohmann::json event = {
+        {"event", "instruction"},
+        {"data", {{"NewLine", instruction_line.dump()}}},
+    };
+    const auto clients = server_.getClients();
+    Require(!clients.empty(), "mock soundbox websocket has no connected clients");
+    for (const auto& client : clients) {
+      client->send(event.dump(), false);
+    }
+  }
+
  private:
   void HandleMessage(ix::WebSocket& web_socket, const ix::WebSocketMessagePtr& message) {
     if (message->type == ix::WebSocketMessageType::Open) {
@@ -416,6 +435,10 @@ class MockLlmTcpServer {
   std::string host() const { return "127.0.0.1"; }
   size_t audio_bytes_received() const { return audio_bytes_received_.load(); }
   bool SawSessionStart() const { return saw_session_start_.load(); }
+  bool SawSessionEnd(const std::string& reason, const std::string& source) const {
+    std::lock_guard<std::mutex> lock(command_mu_);
+    return saw_session_end_ && session_end_reason_ == reason && session_end_source_ == source;
+  }
 
   void Start() {
     audio_thread_ = std::thread([this] { AudioLoop(); });
@@ -542,8 +565,16 @@ class MockLlmTcpServer {
           const std::string line = buffer.substr(0, newline);
           buffer.erase(0, newline + 1);
           const auto message = nlohmann::json::parse(line, nullptr, false);
-          if (!message.is_discarded() && message.value("type", "") == "session_start") {
-            saw_session_start_.store(true);
+          if (!message.is_discarded()) {
+            const std::string type = message.value("type", "");
+            if (type == "session_start") {
+              saw_session_start_.store(true);
+            } else if (type == "session_end") {
+              std::lock_guard<std::mutex> lock(command_mu_);
+              saw_session_end_ = true;
+              session_end_reason_ = message.value("reason", std::string());
+              session_end_source_ = message.value("source", std::string());
+            }
           }
         }
       }
@@ -570,6 +601,10 @@ class MockLlmTcpServer {
   std::atomic<bool> stop_requested_{false};
   std::atomic<size_t> audio_bytes_received_{0};
   std::atomic<bool> saw_session_start_{false};
+  mutable std::mutex command_mu_;
+  bool saw_session_end_{false};
+  std::string session_end_reason_;
+  std::string session_end_source_;
   std::thread audio_thread_;
   std::thread command_thread_;
   std::exception_ptr accept_error_;
@@ -1102,6 +1137,7 @@ static void TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay() {
       [](const std::string&) {});
   shared_llm->Connect();
 
+  std::atomic<bool> send_session_start{false};
   std::atomic<bool> stop_servers{false};
   std::exception_ptr kws_error;
 
@@ -1111,6 +1147,16 @@ static void TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay() {
     try {
       auto client = audio_processing_module::AcceptUnixClientWithTimeout(
           kws_server.get(), std::chrono::seconds(10));
+      while (!send_session_start.load() && !stop_servers.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      if (!stop_servers.load()) {
+        const std::string line =
+            "{\"type\":\"session_start\",\"reason\":\"kws_hit\","
+            "\"score\":3.8,\"timestamp_ms\":1}\n";
+        audio_processing_module::WriteAll(
+            client.get(), reinterpret_cast<const uint8_t*>(line.data()), line.size());
+      }
       while (!stop_servers.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
@@ -1150,6 +1196,10 @@ static void TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay() {
     Require(WaitUntil([&] { return mock_soundbox.SawCommand("fast_recording"); },
                       std::chrono::seconds(5)),
             "frontend should finish soundbox startup");
+    send_session_start.store(true);
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStarted; },
+                      std::chrono::seconds(5)),
+            "frontend should enter SessionStarted before forwarding xiaozhi downlink PCM");
 
     const std::vector<uint8_t> playback_pcm(320, 0x44);
     mock_llm.SendPlaybackAudio(playback_pcm);
@@ -1171,6 +1221,126 @@ static void TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay() {
   kws_thread.join();
   aec_thread.join();
   mock_llm.Stop();
+  if (frontend_error) std::rethrow_exception(frontend_error);
+  if (kws_error) std::rethrow_exception(kws_error);
+}
+
+// 测试 soundbox 设备原生 KWS 在会话中会打断当前 xiaozhi 会话。
+static void TestSoundboxNativeKwsStopsStartedSession() {
+  const std::filesystem::path temp_root = MakeTempDirectory("frontend_native_kws_stop");
+  const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
+  const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
+
+  MockSoundboxWebSocketServer mock_soundbox;
+  MockLlmTcpServer mock_llm;
+  mock_llm.Start();
+
+  auto shared_llm = std::make_shared<LlmClient>(
+      LlmClientOptions{mock_llm.host(), mock_llm.port(), mock_llm.host(),
+                       mock_llm.command_port()},
+      [](const std::string&) {});
+  shared_llm->Connect();
+
+  std::atomic<bool> send_session_start{false};
+  std::atomic<bool> keep_servers_open{true};
+  std::exception_ptr kws_error;
+
+  std::thread kws_server_thread([&] {
+    try {
+      auto server = audio_processing_module::CreateUnixServerSocket(kws_socket, 1);
+      audio_processing_module::SocketPathGuard guard(kws_socket);
+      auto client = audio_processing_module::AcceptUnixClientWithTimeout(
+          server.get(), std::chrono::seconds(10));
+      while (!send_session_start.load() && keep_servers_open.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      if (keep_servers_open.load()) {
+        const std::string line =
+            "{\"type\":\"session_start\",\"reason\":\"kws_hit\","
+            "\"score\":3.8,\"timestamp_ms\":1}\n";
+        audio_processing_module::WriteAll(
+            client.get(), reinterpret_cast<const uint8_t*>(line.data()), line.size());
+      }
+      while (keep_servers_open.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    } catch (...) {
+      kws_error = std::current_exception();
+    }
+  });
+
+  auto aec_server = audio_processing_module::CreateUnixServerSocket(aec_socket, 1);
+  audio_processing_module::SocketPathGuard aec_guard(aec_socket);
+  std::thread aec_server_thread([&] {
+    try {
+      auto client = audio_processing_module::AcceptUnixClientWithTimeout(
+          aec_server.get(), std::chrono::seconds(10));
+      while (keep_servers_open.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    } catch (...) {}
+  });
+
+  Frontend::Options options;
+  options.kws_socket_path = kws_socket;
+  options.aec_socket_path = aec_socket;
+  options.soundbox_config.soundbox.ws_url = mock_soundbox.url();
+  options.soundbox_config.soundbox.ws_token = "mock-token";
+  options.soundbox_config.soundbox.connect_timeout_ms = 3000;
+  options.llm_client = shared_llm;
+
+  Frontend frontend(options);
+  std::exception_ptr frontend_error;
+  std::thread frontend_thread([&] {
+    try { frontend.Run(); }
+    catch (...) { frontend_error = std::current_exception(); }
+  });
+
+  try {
+    Require(WaitUntil([&] { return mock_soundbox.SawCommand("fast_recording"); },
+                      std::chrono::seconds(5)),
+            "frontend should finish soundbox startup");
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStopped; },
+                      std::chrono::seconds(5)),
+            "frontend should enter SessionStopped before KWS start");
+
+    send_session_start.store(true);
+    Require(WaitUntil([&] { return mock_soundbox.SawCommand("llm_start"); },
+                      std::chrono::seconds(5)),
+            "session_start should trigger llm_start");
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStarted; },
+                      std::chrono::seconds(5)),
+            "frontend should enter SessionStarted before native KWS interrupt");
+
+    mock_soundbox.SendNativeKwsEvent();
+    Require(WaitUntil([&] {
+              return mock_llm.SawSessionEnd("soundbox_native_kws", "soundbox");
+            }, std::chrono::seconds(5)),
+            "soundbox native KWS should send session_end to xiaozhi");
+    Require(WaitUntil([&] { return mock_soundbox.SawCommand("llm_stop"); },
+                      std::chrono::seconds(5)),
+            "soundbox native KWS should trigger local llm_stop");
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStopped ||
+                            frontend.state() == Frontend::State::kSessionInit; },
+                      std::chrono::seconds(5)),
+            "native KWS stop should leave frontend stopped or reconnecting");
+  } catch (...) {
+    frontend.Stop();
+    keep_servers_open.store(false);
+    if (frontend_thread.joinable()) frontend_thread.join();
+    if (kws_server_thread.joinable()) kws_server_thread.join();
+    if (aec_server_thread.joinable()) aec_server_thread.join();
+    mock_llm.Stop();
+    throw;
+  }
+
+  frontend.Stop();
+  keep_servers_open.store(false);
+  frontend_thread.join();
+  kws_server_thread.join();
+  aec_server_thread.join();
+  mock_llm.Stop();
+
   if (frontend_error) std::rethrow_exception(frontend_error);
   if (kws_error) std::rethrow_exception(kws_error);
 }
@@ -1269,6 +1439,11 @@ static void TestFrontendMockSoundboxSmokeLoop() {
     Require(WaitUntil([&] { return aec_bytes.load() >= 640; }, std::chrono::seconds(5)),
             "AEC-mode record audio should be routed to AEC socket");
 
+    const std::vector<uint8_t> playback_pcm(320, 0x33);
+    mock_llm.SendPlaybackAudio(playback_pcm);
+    Require(WaitUntil([&] { return mock_soundbox.SawPlayPacket(); }, std::chrono::seconds(5)),
+            "xiaozhi downlink PCM should be forwarded as websocket tag=play packet");
+
     mock_llm.SendSessionEnd();
     Require(WaitUntil([&] { return mock_soundbox.SawCommand("llm_stop"); },
                       std::chrono::seconds(5)),
@@ -1280,11 +1455,6 @@ static void TestFrontendMockSoundboxSmokeLoop() {
 
     Require(WaitUntil([&] { return mock_llm.SawSessionStart(); }, std::chrono::seconds(5)),
             "kws hit should send session_start to xiaozhi command channel");
-
-    const std::vector<uint8_t> playback_pcm(320, 0x33);
-    mock_llm.SendPlaybackAudio(playback_pcm);
-    Require(WaitUntil([&] { return mock_soundbox.SawPlayPacket(); }, std::chrono::seconds(5)),
-            "xiaozhi downlink PCM should be forwarded as websocket tag=play packet");
   } catch (...) {
     frontend.Stop();
     keep_control_open.store(false);
@@ -1639,6 +1809,8 @@ int main() {
     TestFrontendControlSocketDisconnectsReconnect();
     std::cerr << "[ RUN      ] TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay\n";
     TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay();
+    std::cerr << "[ RUN      ] TestSoundboxNativeKwsStopsStartedSession\n";
+    TestSoundboxNativeKwsStopsStartedSession();
     std::cerr << "[ RUN      ] TestFrontendMockSoundboxSmokeLoop\n";
     TestFrontendMockSoundboxSmokeLoop();
     std::cerr << "[ RUN      ] TestWavWriterPatchesHeaderAfterStreamingSamples\n";

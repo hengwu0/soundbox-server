@@ -2,6 +2,8 @@
 
 #include "common/log.hpp"
 
+#include <utility>
+
 namespace xiaoai_server::soundbox {
 
 namespace {
@@ -29,6 +31,12 @@ std::string FirstResultText(const nlohmann::json& payload) {
 // - 无。
 EventDispatcher::EventDispatcher()
     : unknown_logger_(kLog, std::chrono::milliseconds(3000), true) {}
+
+// 设置 soundbox 原生 KWS 唤醒事件回调。
+void EventDispatcher::set_soundbox_native_kws_callback(
+    OnSoundboxNativeKwsCallback callback) {
+  on_soundbox_native_kws_ = std::move(callback);
+}
 
 // 处理事件包。
 //
@@ -91,6 +99,9 @@ void EventDispatcher::Handle(const Packet& packet) {
     const bool is_vad_begin = payload.value("is_vad_begin", false);
     if (text.empty() && !is_vad_begin) {
       kLog->info("小爱唤醒事件");
+      if (on_soundbox_native_kws_) {
+        on_soundbox_native_kws_();
+      }
     } else if (is_final && !text.empty()) {
       kLog->info("小爱收到指令: {}", text);
     } else {

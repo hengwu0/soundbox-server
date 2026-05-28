@@ -214,11 +214,10 @@ Frontend::~Frontend() {
   Stop();
 }
 
-// 获取当前状态（线程安全）
+// 获取当前状态快照（用于外部观察/测试，不参与业务决策）
 // 返回：当前 Frontend::State 枚举值
 Frontend::State Frontend::state() const {
-  std::lock_guard<std::mutex> lock(mu_);
-  return state_;
+  return state_snapshot_.load();
 }
 
 // 启动前端主循环，完成以下初始化步骤：
@@ -234,8 +233,13 @@ Frontend::State Frontend::state() const {
 void Frontend::Run() {
   // 重置停止标志，允许重新运行
   stop_requested_.store(false);
-  // 启动时立即进入空闲状态，等待唤醒
-  SetState(State::kSessionStopped, "startup");
+  kws_uplink_enabled_.store(false);
+  aec_uplink_enabled_.store(false);
+  llm_uplink_enabled_.store(false);
+  playback_enabled_.store(false);
+  state_ = State::kSessionInit;
+  state_snapshot_.store(State::kSessionInit);
+  StartEventLoop();
 
   // 带重试连接 KWS 控制/音频 socket
   kws_socket_ = audio_processing_module::ConnectUnixSocketWithRetry(
@@ -250,6 +254,9 @@ void Frontend::Run() {
     llm_client_->set_session_end_callback(
         [this](const std::string& reason) { OnLlmSessionEnd(reason); });
     llm_client_->set_playback_audio_callback([this](const std::vector<uint8_t>& chunk) {
+      if (!playback_enabled_.load()) {
+        return;
+      }
       if (client_ && !client_->PlayPcm(chunk)) {
         kLog->warn("PlayPcm failed xiaozhi_downlink_bytes={}", chunk.size());
       }
@@ -261,15 +268,31 @@ void Frontend::Run() {
   //   on_audio：接收话筒/喇叭音频用于 AEC 处理
   //   on_connection_closed：SoundBox 连接意外断开时进入重连状态
   xiaoai_server::soundbox::SoundBoxClient::Callbacks callbacks;
-  callbacks.on_wakeup_audio = [this](const std::vector<uint8_t>& chunk) {
+  const uint64_t soundbox_generation = soundbox_generation_.load();
+  callbacks.on_wakeup_audio = [this, soundbox_generation](const std::vector<uint8_t>& chunk) {
+    if (soundbox_generation != soundbox_generation_.load()) {
+      return;
+    }
     OnWakeupAudio(chunk);
   };
-  callbacks.on_audio = [this](const std::vector<uint8_t>& chunk) {
+  callbacks.on_audio = [this, soundbox_generation](const std::vector<uint8_t>& chunk) {
+    if (soundbox_generation != soundbox_generation_.load()) {
+      return;
+    }
     OnAecAudio(chunk);
   };
-  callbacks.on_connection_closed = [this](const std::string& reason) {
+  callbacks.on_connection_closed = [this, soundbox_generation](const std::string& reason) {
+    if (soundbox_generation != soundbox_generation_.load()) {
+      return;
+    }
     kLog->warn("soundbox connection closed reason={}", reason);
-    EnterSessionInitAndRestart("soundbox_connection_closed");
+    PostEvent(Event{EventType::kSoundboxDisconnected, "soundbox_connection_closed", reason});
+  };
+  callbacks.on_soundbox_native_kws = [this, soundbox_generation] {
+    if (soundbox_generation != soundbox_generation_.load()) {
+      return;
+    }
+    OnSoundboxNativeKws();
   };
   client_ = std::make_unique<xiaoai_server::soundbox::SoundBoxClient>(
       options_.soundbox_config, std::move(callbacks));
@@ -281,11 +304,15 @@ void Frontend::Run() {
   if (!client_->Start()) {
     // 启动失败：进入初始重连状态并停止所有组件
     const std::string error_detail = client_->LastConnectError();
-    SetState(State::kSessionInit, "soundbox_start_failed");
+    PostEvent(Event{EventType::kSoundboxDisconnected, "soundbox_start_failed", error_detail});
     Stop();
     throw std::runtime_error(
         error_detail.empty() ? "failed to start soundbox frontend" : error_detail);
   }
+
+  // SoundBox 链路和本地 socket 均已就绪，投递初始化完成事件，由 Frontend
+  // 控制面事件线程串行进入空闲态。
+  PostEvent(Event{EventType::kFrontendReady, "startup"});
 
   // 主线程阻塞等待停止信号（Stop() 或 EnterSessionInitAndRestart() 重连失败会通知条件变量）
   std::unique_lock<std::mutex> lock(mu_);
@@ -297,11 +324,16 @@ void Frontend::Run() {
 void Frontend::Stop() {
   // 原子交换设置停止标志，记录本次调用前是否已停止
   const bool was_stopped = stop_requested_.exchange(true);
+  kws_uplink_enabled_.store(false);
+  aec_uplink_enabled_.store(false);
+  llm_uplink_enabled_.store(false);
+  playback_enabled_.store(false);
   // 通知主线程条件变量，解除 Run() 阻塞
   stop_cv_.notify_all();
 
   // 停止 SoundBox 客户端：断开与 SoundBox 服务器的连接
   if (client_) {
+    soundbox_generation_.fetch_add(1);
     client_->Stop();
   }
   // 断开 xiaozhi TCP 客户端连接
@@ -310,10 +342,15 @@ void Frontend::Stop() {
   }
 
   // 关闭 KWS 和 AEC socket 读写通道并释放文件描述符
+  kws_generation_.fetch_add(1);
   ShutdownSocket(kws_socket_.get());
   ShutdownSocket(aec_socket_.get());
   kws_socket_.reset();
   aec_socket_.reset();
+
+  // 停止 Frontend 控制面事件循环。资源先断开，确保事件线程里可能阻塞的
+  // NotifyLlmStart/NotifyLlmStop 等操作能够被上游 Stop/Disconnect 唤醒。
+  StopEventLoop();
 
   if (!was_stopped) {
     kLog->info("stop requested");
@@ -331,7 +368,7 @@ void Frontend::Stop() {
 // chunk：音频数据块（PCM 格式）
 // 仅在 kSessionStopped 状态下写入，其他状态丢弃该音频块（避免在会话中向 KWS 引擎注入无关音频）
 void Frontend::OnWakeupAudio(const std::vector<uint8_t>& chunk) {
-  if (state() != State::kSessionStopped) {
+  if (!kws_uplink_enabled_.load()) {
     kLog->debug("drop KWS audio while state={}", StateName(state()));
     return;
   }
@@ -342,7 +379,7 @@ void Frontend::OnWakeupAudio(const std::vector<uint8_t>& chunk) {
 // chunk：音频数据块（PCM 格式）
 // 仅在 kSessionStarted 状态下写入，其他状态丢弃（非会话期间无需 AEC 处理）
 void Frontend::OnAecAudio(const std::vector<uint8_t>& chunk) {
-  if (state() != State::kSessionStarted) {
+  if (!aec_uplink_enabled_.load()) {
     kLog->debug("drop AEC audio while state={}", StateName(state()));
     return;
   }
@@ -353,23 +390,29 @@ void Frontend::OnAecAudio(const std::vector<uint8_t>& chunk) {
 // processed_pcm：回声消除处理后的音频数据
 // 仅在 xiaozhi 客户端已连接时发送，未连接时丢弃
 void Frontend::OnAecProcessedAudio(const std::vector<uint8_t>& processed_pcm) {
-  if (llm_client_ && llm_client_->connected()) {
+  if (llm_uplink_enabled_.load() && llm_client_ && llm_client_->connected()) {
     llm_client_->SendAudio(processed_pcm);
   }
 }
 
 // xiaozhi 会话停止回调：由 xiaozhi 客户端在会话结束时调用（如 VAD 静音超时）
 // reason：会话停止原因字符串
-// 转发给 HandleSessionStop 执行状态转换，仅在 kSessionStarted 状态时有效
+// 投递给 Frontend 控制面事件队列串行处理。
 void Frontend::OnLlmSessionEnd(const std::string& reason) {
-  HandleSessionStop(reason);
+  PostEvent(Event{EventType::kXiaozhiSessionEnd, reason, "xiaozhi"});
+}
+
+// SoundBox 设备自身 KWS 唤醒事件回调：投递给 Frontend 控制面事件队列串行处理。
+void Frontend::OnSoundboxNativeKws() {
+  PostEvent(Event{EventType::kSoundboxNativeKws, "soundbox_native_kws", "soundbox"});
 }
 
 // KWS 控制通道读取线程主循环：
 // 循环从 KWS socket 读取 JSON 行消息，解析为 session_start 控制消息，
-// 分发给 HandleSessionStart 处理。线程退出条件为 IsStopping() 返回 true
+// 投递给 Frontend 控制面事件队列处理。线程退出条件为 IsStopping() 返回 true
 // 或在读取/解析过程中发生异常（此时进入故障状态）。
 void Frontend::KwsControlReaderLoop() {
+  const uint64_t kws_generation = kws_generation_.load();
   try {
     while (!IsStopping()) {
       // 阻塞读取一行 JSON（对端 KWS 引擎发送控制消息）
@@ -381,38 +424,154 @@ void Frontend::KwsControlReaderLoop() {
       // 解析并校验 JSON 行，期望类型为 session_start
       const ControlMessage message =
           ParseControlMessageLine(line, ControlMessageType::kSessionStart);
-      HandleSessionStart(message);
+      if (kws_generation != kws_generation_.load()) {
+        return;
+      }
+      PostEvent(Event{EventType::kLocalKwsHit, message.reason, "local_kws",
+                      message.score, message.timestamp_ms});
     }
   } catch (const std::exception& error) {
     // 非正常停止时的异常：记录错误、进入初始重连状态并重连音频链路
-    if (!IsStopping()) {
+    if (!IsStopping() && kws_generation == kws_generation_.load()) {
       kLog->error("KWS control reader failed: {}", error.what());
-      EnterSessionInitAndRestart("kws_control_socket_disconnected");
+      PostEvent(Event{EventType::kKwsControlDisconnected,
+                      "kws_control_socket_disconnected", error.what()});
     }
   }
 }
 
-// 处理 session_start 消息：仅在 kSessionStopped 状态下有效，表示唤醒词命中，
-// 需要启动 xiaozhi 会话。调用 SoundBox NotifyLlmStart() 通知下游启动 LLM raw 通道。
-// message：已解析的 session_start 控制消息，reason 为 "kws_hit"
-// 成功后进入 kSessionStarted 状态开始 AEC 处理，失败则回到 kSessionStopped 继续等待下一次唤醒。
-void Frontend::HandleSessionStart(const ControlMessage& message) {
-  if (state() != State::kSessionStopped) {
-    kLog->warn("ignore duplicate session_start while state={}", StateName(state()));
+// 启动 Frontend 控制面事件循环。事件循环是唯一允许驱动 state_ 流转的上下文。
+void Frontend::StartEventLoop() {
+  {
+    std::lock_guard<std::mutex> lock(event_mu_);
+    if (event_loop_running_) {
+      return;
+    }
+    event_loop_running_ = true;
+    event_queue_.clear();
+  }
+  event_thread_ = std::thread([this] { EventLoop(); });
+}
+
+// 停止 Frontend 控制面事件循环并等待线程退出。
+void Frontend::StopEventLoop() {
+  {
+    std::lock_guard<std::mutex> lock(event_mu_);
+    event_loop_running_ = false;
+    event_queue_.clear();
+  }
+  event_cv_.notify_all();
+
+  const std::thread::id current_thread = std::this_thread::get_id();
+  if (event_thread_.joinable() && event_thread_.get_id() != current_thread) {
+    event_thread_.join();
+  }
+}
+
+// 投递控制面事件；状态机不会在调用方线程内直接流转。
+void Frontend::PostEvent(Event event) {
+  {
+    std::lock_guard<std::mutex> lock(event_mu_);
+    if (!event_loop_running_ || stop_requested_.load()) {
+      kLog->debug("drop frontend event reason={} while event loop stopped",
+                  event.reason);
+      return;
+    }
+    event_queue_.push_back(std::move(event));
+  }
+  event_cv_.notify_one();
+}
+
+// Frontend 控制面事件循环：串行消费所有会改变状态机的事件。
+void Frontend::EventLoop() {
+  while (true) {
+    Event event;
+    {
+      std::unique_lock<std::mutex> lock(event_mu_);
+      event_cv_.wait(lock, [this] {
+        return !event_loop_running_ || !event_queue_.empty();
+      });
+      if (!event_loop_running_ && event_queue_.empty()) {
+        break;
+      }
+      event = std::move(event_queue_.front());
+      event_queue_.pop_front();
+    }
+
+    try {
+      DispatchEvent(event);
+    } catch (const std::exception& error) {
+      kLog->error("frontend event failed reason={} error={}", event.reason,
+                  error.what());
+      if (!IsStopping()) {
+        HandleReconnectRequired(Event{EventType::kReconnectRequired,
+                                      "frontend_event_failed", error.what()});
+      }
+    }
+  }
+}
+
+// 分发单个 Frontend 控制面事件。
+void Frontend::DispatchEvent(const Event& event) {
+  switch (event.type) {
+    case EventType::kFrontendReady:
+      HandleFrontendReady(event);
+      return;
+    case EventType::kLocalKwsHit:
+      HandleSessionStart(event);
+      return;
+    case EventType::kXiaozhiSessionEnd:
+      HandleSessionStop(event);
+      return;
+    case EventType::kSoundboxNativeKws:
+      HandleSoundboxNativeKws(event);
+      return;
+    case EventType::kSoundboxDisconnected:
+    case EventType::kKwsControlDisconnected:
+    case EventType::kReconnectRequired:
+      HandleReconnectRequired(event);
+      return;
+  }
+}
+
+// 初始化完成后进入空闲状态并打开 KWS 数据面门控。
+void Frontend::HandleFrontendReady(const Event& event) {
+  if (state_ != State::kSessionInit && state_ != State::kSessionStopped) {
+    kLog->warn("ignore frontend ready while state={}", StateName(state_));
     return;
   }
+  SetState(State::kSessionStopped, event.reason.empty() ? "startup" : event.reason.c_str());
+}
+
+// SoundBox WS 或本地控制 socket 异常时进入重连流程。
+void Frontend::HandleReconnectRequired(const Event& event) {
+  const char* reason = event.reason.empty() ? "reconnect_required" : event.reason.c_str();
+  EnterSessionInitAndRestart(reason);
+}
+
+// 处理 session_start 事件：仅在 kSessionStopped 状态下有效，表示唤醒词命中，
+// 需要启动 xiaozhi 会话。调用 SoundBox NotifyLlmStart() 通知下游启动 LLM raw 通道。
+// event：本地 KWS session_start 控制事件
+// 成功后进入 kSessionStarted 状态开始 AEC 处理，失败则回到 kSessionStopped 继续等待下一次唤醒。
+void Frontend::HandleSessionStart(const Event& event) {
+  if (state_ != State::kSessionStopped) {
+    kLog->warn("ignore duplicate session_start while state={}", StateName(state_));
+    return;
+  }
+
   // 进入会话启动中状态
   SetState(State::kSessionStarting,
-           message.reason.empty() ? "session_start" : message.reason.c_str());
+           event.reason.empty() ? "session_start" : event.reason.c_str());
   // 按 xiaozhi 命令通道协议发送 session_start JSON line。
-  if (!llm_client_ || !llm_client_->SendSessionStart(message.reason, message.score,
-                                                     message.timestamp_ms)) {
+  const std::string reason = event.reason.empty() ? "kws_hit" : event.reason;
+  if (!llm_client_ || !llm_client_->SendSessionStart(reason, event.score,
+                                                     event.timestamp_ms)) {
     SetState(State::kSessionStopped, "xiaozhi_session_start_failed");
     return;
   }
   // 通知 SoundBox 启用 LLM raw 通道
   if (client_ && client_->NotifyLlmStart()) {
-    // LLM raw 通道启用成功：进入会话进行中状态，开始 AEC 处理和音频转发
+    // LLM raw 通道启用成功：进入会话进行中状态，开始 AEC 处理和音频转发。
     SetState(State::kSessionStarted, "llm_start_ok");
     return;
   }
@@ -420,29 +579,57 @@ void Frontend::HandleSessionStart(const ControlMessage& message) {
   SetState(State::kSessionStopped, "llm_start_failed");
 }
 
-// 处理 session_stop 消息：仅在 kSessionStarted 状态下有效，表示当前 xiaozhi 会话已结束
+// SoundBox 设备自身 KWS 唤醒事件：仅在 kSessionStarted 中作为打断当前
+// xiaozhi 会话的信号；如果事件发生在 kSessionStarting 期间，会先排队，
+// 等启动处理完成后再看到 kSessionStarted 并执行停止。
+void Frontend::HandleSoundboxNativeKws(const Event& event) {
+  if (state_ != State::kSessionStarted) {
+    kLog->debug("ignore soundbox native KWS while state={}", StateName(state_));
+    return;
+  }
+  StopSessionBySoundboxNativeKws(event);
+}
+
+// SoundBox 原生 KWS 打断当前会话：主动通知 xiaozhi 结束会话，
+// 然后复用本地 session_stop 流程关闭 SoundBox LLM raw 通道。
+void Frontend::StopSessionBySoundboxNativeKws(const Event& event) {
+  SetState(State::kSessionStopping, "soundbox_native_kws");
+  if (llm_client_ &&
+      !llm_client_->SendSessionEnd("soundbox_native_kws", "soundbox")) {
+    kLog->warn("failed to send soundbox_native_kws session_end to xiaozhi");
+  }
+  FinishSessionStop(event.reason.empty() ? "soundbox_native_kws" : event.reason.c_str());
+}
+
+// 处理 session_stop 事件：仅在 kSessionStarted 状态下有效，表示当前 xiaozhi 会话已结束
 //（如 VAD 静音超时或显式结束）。通知 SoundBox 停止 LLM raw 通道，
 // 最终回到 kSessionStopped 状态继续等待下一次唤醒。
-// reason：session 停止原因字符串
+// event：session 停止事件，reason 为停止原因字符串
 // 成功后：kSessionStopping → kSessionStopped（回到空闲状态，等待下一次唤醒）
-// 失败后：kSessionStopping → kSessionStopped（停止失败仍回到 kSessionStopped，但需重连ws音频链路）
-void Frontend::HandleSessionStop(const std::string& reason) {
-  if (state() != State::kSessionStarted) {
+// 失败后：kSessionStopping → kSessionInit（重连 ws 音频链路）
+void Frontend::HandleSessionStop(const Event& event) {
+  if (state_ != State::kSessionStarted) {
     // 非 kSessionStarted 状态收到 session_stop 是异常情况，记录警告并忽略
-    kLog->warn("ignore session_stop from LLM while state={}", StateName(state()));
+    kLog->warn("ignore session_stop from LLM while state={}", StateName(state_));
     return;
   }
   // 进入会话停止中状态
   SetState(State::kSessionStopping,
-           reason.empty() ? "session_stop" : reason.c_str());
+           event.reason.empty() ? "session_stop" : event.reason.c_str());
+  FinishSessionStop(event.reason.empty() ? "session_stop" : event.reason.c_str());
+}
+
+// 完成已经进入 kSessionStopping 后的本地停止流程。
+void Frontend::FinishSessionStop(const char* reason) {
   // 通知 SoundBox 停止 LLM raw 通道
   if (client_ && client_->NotifyLlmStop()) {
     // LLM raw 通道停止成功：回到空闲状态，继续等待下一次唤醒
     SetState(State::kSessionStopped, "llm_stop_ok");
     return;
   }
-  // LLM raw 通道停止失败：仍回到空闲状态，需重连 ws 音频链路
-  kLog->warn("llm_stop failed after session_stop; reconnecting soundbox audio link");
+  // LLM raw 通道停止失败：进入初始状态并重连 ws 音频链路
+  kLog->warn("llm_stop failed after session_stop reason={}; reconnecting soundbox audio link",
+             reason);
   EnterSessionInitAndRestart("llm_stop_failed");
 }
 
@@ -456,9 +643,11 @@ void Frontend::EnterSessionInitAndRestart(const char* reason) {
   SetState(State::kSessionInit, reason);
   // 断开当前 SoundBox 客户端连接
   if (client_) {
+    soundbox_generation_.fetch_add(1);
     client_->Stop();
   }
   // 关闭 KWS 和 AEC socket 读写通道
+  kws_generation_.fetch_add(1);
   ShutdownSocket(kws_socket_.get());
   ShutdownSocket(aec_socket_.get());
   kws_socket_.reset();
@@ -485,15 +674,32 @@ bool Frontend::RestartSoundboxAudioLink() {
   try {
     // 重新注册 SoundBox 客户端回调
     xiaoai_server::soundbox::SoundBoxClient::Callbacks callbacks;
-    callbacks.on_wakeup_audio = [this](const std::vector<uint8_t>& chunk) {
+    const uint64_t soundbox_generation = soundbox_generation_.load();
+    callbacks.on_wakeup_audio = [this, soundbox_generation](const std::vector<uint8_t>& chunk) {
+      if (soundbox_generation != soundbox_generation_.load()) {
+        return;
+      }
       OnWakeupAudio(chunk);
     };
-    callbacks.on_audio = [this](const std::vector<uint8_t>& chunk) {
+    callbacks.on_audio = [this, soundbox_generation](const std::vector<uint8_t>& chunk) {
+      if (soundbox_generation != soundbox_generation_.load()) {
+        return;
+      }
       OnAecAudio(chunk);
     };
-    callbacks.on_connection_closed = [this](const std::string& reason) {
+    callbacks.on_connection_closed = [this, soundbox_generation](const std::string& reason) {
+      if (soundbox_generation != soundbox_generation_.load()) {
+        return;
+      }
       kLog->warn("soundbox connection closed during reconnect reason={}", reason);
-      EnterSessionInitAndRestart("soundbox_connection_closed_reconnect");
+      PostEvent(Event{EventType::kSoundboxDisconnected,
+                      "soundbox_connection_closed_reconnect", reason});
+    };
+    callbacks.on_soundbox_native_kws = [this, soundbox_generation] {
+      if (soundbox_generation != soundbox_generation_.load()) {
+        return;
+      }
+      OnSoundboxNativeKws();
     };
     client_ = std::make_unique<xiaoai_server::soundbox::SoundBoxClient>(
         options_.soundbox_config, std::move(callbacks));
@@ -524,19 +730,31 @@ bool Frontend::RestartSoundboxAudioLink() {
   }
 }
 
-// 线程安全地设置状态并记录日志
+// 设置状态并记录日志。该方法只能在 Frontend 控制面事件线程内调用；
+// 数据面通过 atomic gate 观察是否允许上行/播放，不直接参与状态流转。
 // next：目标状
 // reason：状态变更原因描述
 // 相同状态不重复设置（避免日志刷屏）
 void Frontend::SetState(State next, const char* reason) {
-  std::lock_guard<std::mutex> lock(mu_);
   if (state_ == next) {
+    state_snapshot_.store(next);
+    kws_uplink_enabled_.store(next == State::kSessionStopped);
+    aec_uplink_enabled_.store(next == State::kSessionStarted);
+    llm_uplink_enabled_.store(next == State::kSessionStarted);
+    playback_enabled_.store(next == State::kSessionStarted);
     return;  // 状态未变化，无需处理
   }
   // 记录状态变更日志，包含旧状态、新状态和变更原因
   kLog->info("state change from={} to={} reason={}",
              StateName(state_), StateName(next), reason);
   state_ = next;
+  state_snapshot_.store(next);
+
+  // 数据面门控：高频音频不进入 Frontend 事件队列，只读取这些开关。
+  kws_uplink_enabled_.store(next == State::kSessionStopped);
+  aec_uplink_enabled_.store(next == State::kSessionStarted);
+  llm_uplink_enabled_.store(next == State::kSessionStarted);
+  playback_enabled_.store(next == State::kSessionStarted);
 }
 
 // 检查是否已收到停止请求（原子变量读取，无锁线程安全）

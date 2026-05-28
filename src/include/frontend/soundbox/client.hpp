@@ -40,6 +40,8 @@ class SoundBoxClient {
     std::function<void(const std::vector<uint8_t>&)> on_audio;
     // on_connection_closed 在 WebSocket 异常断开时调用。
     std::function<void(const std::string&)> on_connection_closed;
+    // on_soundbox_native_kws 在 soundbox 设备自身 KWS 唤醒事件上报时调用。
+    std::function<void()> on_soundbox_native_kws;
   };
 
   // 构造 soundbox 客户端。
@@ -119,6 +121,9 @@ class SoundBoxClient {
   // 处理一帧 WebSocket message。
   void HandleMessageFrame(bool binary, const std::string& payload);
 
+  // 异步分发 soundbox 原生 KWS 事件，避免在 ixwebsocket 回调线程里执行阻塞 RPC。
+  void DispatchSoundboxNativeKwsCallback();
+
   // 生成请求 ID。
   static std::string NextId();
 
@@ -133,7 +138,7 @@ class SoundBoxClient {
   PacketParser packet_parser_;
   // response_hub_ 管理 request_id 等待和唤醒。
   ResponseHub response_hub_;
-  // event_dispatcher_ 处理 playing/instruction 事件日志。
+  // event_dispatcher_ 处理 playing/instruction 事件日志，并向上转发 soundbox 原生 KWS。
   EventDispatcher event_dispatcher_;
   // mode_controller_ 管理 Kws/LlmStarting/LlmWorking/LlmStopping/Fault/Stopped。
   ModeController mode_controller_;
@@ -161,6 +166,9 @@ class SoundBoxClient {
   mutable std::mutex write_mu_;
   // running_ 表示客户端已启动。
   std::atomic<bool> running_{false};
+  // native_kws_callback_running_ 防止连续原生 KWS 事件重复启动打断任务。
+  std::shared_ptr<std::atomic<bool>> native_kws_callback_running_{
+      std::make_shared<std::atomic<bool>>(false)};
   // last_connect_error_ 存储最近一次连接失败的错误详情，用于启动时报错区分 URL/token 错误。
   std::string last_connect_error_;
 };

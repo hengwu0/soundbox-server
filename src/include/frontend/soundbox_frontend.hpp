@@ -8,6 +8,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -50,6 +51,9 @@ ControlMessage ParseControlMessageLine(const std::string& line,
 //     → kSessionStopping（会话停止中：收到 session_stop，正在通知 SoundBox 关闭 LLM 通道）
 //     → kSessionStopped（回到空闲状态，等待下一次唤醒）
 //   任意状态遇到 AEC/KWS socket 断开或 WS 断开时回到 kSessionInit，重连 ws 音频链路。
+//
+// 控制面状态机采用单线程事件队列串行处理；外部回调只能 PostEvent，不能直接修改 state_。
+// 高频音频数据不进入事件队列，只读取状态机维护的 atomic 门控开关。
 class Frontend {
  public:
   // 前端运行状态枚举
@@ -74,7 +78,7 @@ class Frontend {
   // 析构函数：确保 Stop() 被调用以释放资源并安全退出
   ~Frontend();
 
-  // 获取当前状态（线程安全，加锁读取）
+  // 获取当前状态快照（仅用于外部观察/测试，不参与业务决策）
   State state() const;
 
   // 启动前端主循环：连接 KWS/AEC socket、初始化 SoundBox 和 xiaozhi 客户端、
@@ -98,23 +102,64 @@ class Frontend {
   void OnAecProcessedAudio(const std::vector<uint8_t>& processed_pcm);
   // LLM 会话结束回调：由 LLM 客户端在会话结束时调用（如 VAD 静音超时）
   // reason：会话结束原因字符串，由 LLM 客户端提供
-  // 转发给 HandleSessionStop 执行状态转换逻辑
+  // 投递给 Frontend 事件队列串行处理
   void OnLlmSessionEnd(const std::string& reason);
-  // KWS 控制通道读取线程：循环读取 session_start 消息并分发给 HandleSessionStart
+  // SoundBox 设备自身 KWS 唤醒事件回调：投递给 Frontend 事件队列串行处理。
+  void OnSoundboxNativeKws();
+  // KWS 控制通道读取线程：循环读取 session_start 消息并投递 Frontend 控制事件
   void KwsControlReaderLoop();
+
+  // Frontend 控制面事件类型：所有会改变状态机的外部信号都必须先进入事件队列。
+  enum class EventType {
+    kFrontendReady,             // Run() 初始化完成，进入空闲态
+    kLocalKwsHit,               // soundbox-server 本地 KWS 命中
+    kXiaozhiSessionEnd,         // xiaozhi 命令通道收到 session_end
+    kSoundboxNativeKws,         // SoundBox 设备原生 KWS 唤醒事件
+    kSoundboxDisconnected,      // SoundBox WS 断开，需要重连
+    kKwsControlDisconnected,    // KWS 控制 socket 断开，需要重连
+    kReconnectRequired,         // Frontend 内部错误触发重连
+  };
+
+  // Frontend 控制面事件载荷。
+  struct Event {
+    EventType type;
+    std::string reason;
+    std::string source;
+    std::optional<double> score;
+    std::optional<int64_t> timestamp_ms;
+  };
+
+  // 启停 Frontend 控制面事件循环线程。
+  void StartEventLoop();
+  void StopEventLoop();
+  // 投递控制面事件。该方法可由任意回调线程调用，但不会直接修改 state_。
+  void PostEvent(Event event);
+  // 控制面事件循环：唯一允许执行状态机流转的线程。
+  void EventLoop();
+  // 分发单个控制面事件。
+  void DispatchEvent(const Event& event);
+  // 处理初始化完成事件：进入 kSessionStopped 空闲态。
+  void HandleFrontendReady(const Event& event);
+  // 处理 SoundBox WS / KWS socket 断开事件。
+  void HandleReconnectRequired(const Event& event);
   // 处理 session_start 消息：仅在 kSessionStopped 状态下有效
-  // message：已解析的 session_start 控制消息
+  // event：本地 KWS session_start 控制事件
   // 成功后进入 kSessionStarting → kSessionStarted，失败则回到 kSessionStopped 继续等待唤醒
-  void HandleSessionStart(const ControlMessage& message);
+  void HandleSessionStart(const Event& event);
   // 处理 session_stop 消息：仅在 kSessionStarted 状态下有效，其他状态输出警告并忽略
-  // reason：session 结束原因字符串
+  // event：session 结束事件
   // 进入 kSessionStopping，通知下游停止 LLM，最终回到 kSessionStopped 空闲状态
-  void HandleSessionStop(const std::string& reason);
+  void HandleSessionStop(const Event& event);
+  // SoundBox 原生 KWS 打断当前会话：先向 xiaozhi 主动发送 session_end，再走本地 session_stop。
+  void HandleSoundboxNativeKws(const Event& event);
+  void StopSessionBySoundboxNativeKws(const Event& event);
+  // 完成已经进入 kSessionStopping 后的本地 session_stop 清理。
+  void FinishSessionStop(const char* reason);
   // 进入初始重连状态：设置 kSessionInit 状态、断开当前链路、
   // 尝试重连 WebSocket 音频链路。重连成功后回到 kSessionStopped 空闲状态。
   // reason：断连原因描述，用于日志诊断
   void EnterSessionInitAndRestart(const char* reason);
-  // 线程安全地设置状态并记录日志，相同状态不重复设置
+  // 设置状态并记录日志，相同状态不重复设置。只能在 Frontend 事件线程内调用。
   // next：目标状态
   // reason：状态变更原因描述
   void SetState(State next, const char* reason);
@@ -129,9 +174,21 @@ class Frontend {
   audio_processing_module::FileDescriptor kws_socket_;   // KWS 控制和音频 Unix socket
   audio_processing_module::FileDescriptor aec_socket_;   // AEC 音频 Unix socket
   std::thread kws_control_thread_;   // KWS 控制消息读取线程
-  mutable std::mutex mu_;            // 保护 state_ 和条件变量的互斥锁
+  std::thread event_thread_;         // Frontend 控制面事件循环线程
+  mutable std::mutex mu_;            // 保护停止条件变量
   std::condition_variable stop_cv_;  // 停止条件变量，用于阻塞 Run() 主循环等待停止信号
+  std::mutex event_mu_;              // 保护 Frontend 控制面事件队列
+  std::condition_variable event_cv_; // Frontend 控制面事件队列条件变量
+  std::deque<Event> event_queue_;    // Frontend 控制面事件队列
+  bool event_loop_running_{false};   // Frontend 控制面事件循环是否运行
   State state_{State::kSessionInit};  // 当前运行状态，默认为 kSessionInit 初始/重连状态
+  std::atomic<State> state_snapshot_{State::kSessionInit};  // 供外部只读观察的状态快照
+  std::atomic<bool> kws_uplink_enabled_{false};      // 数据面门控：是否允许向 KWS socket 写入唤醒音频
+  std::atomic<bool> aec_uplink_enabled_{false};      // 数据面门控：是否允许向 AEC socket 写入会话音频
+  std::atomic<bool> llm_uplink_enabled_{false};      // 数据面门控：是否允许向 xiaozhi 音频通道上行 PCM
+  std::atomic<bool> playback_enabled_{false};        // 数据面门控：是否允许播放 xiaozhi 下行 PCM
+  std::atomic<uint64_t> soundbox_generation_{0};      // SoundBox 客户端代际，用于丢弃旧连接的异步回调
+  std::atomic<uint64_t> kws_generation_{0};           // KWS 控制 socket 代际，用于丢弃旧连接的异步事件
   std::atomic<bool> stop_requested_{false};  // 停止请求标志，原子变量保证多线程可见性
 };
 
