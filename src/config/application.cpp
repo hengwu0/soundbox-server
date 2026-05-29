@@ -347,12 +347,15 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
          << defaults.runtime.soundbox.connect_timeout_ms << "\n"
          << "  llm_start_timeout_ms: 1000\n"
          << "  llm_stop_timeout_ms: 1000\n"
-         << "  native_kws_triggers:\n";
+         << "  wakeup_ack_texts:\n";
+  for (const auto& text : defaults.runtime.soundbox.wakeup_ack_texts) {
+    output << "    - \"" << text << "\"\n";
+  }
+  output << "  native_kws_triggers:\n";
   for (const auto& trigger : defaults.runtime.soundbox.native_kws_triggers) {
     output << "    - \"" << trigger << "\"\n";
   }
   output << "wakeup:\n"
-         << "  say_hello: \"" << defaults.runtime.wakeup.say_hello << "\"\n"
          << "  keywords_file: \"" << defaults.runtime.wakeup.keywords_file << "\"\n"
          << "  tokens_path: \"" << defaults.runtime.wakeup.tokens_path << "\"\n"
          << "  encoder_path: \"" << defaults.runtime.wakeup.encoder_path << "\"\n"
@@ -416,6 +419,10 @@ bool BeginConfigSequence(PipelineOptions* options, const std::string& key) {
     options->runtime.soundbox.native_kws_triggers.clear();
     return true;
   }
+  if (key == "soundbox.wakeup_ack_texts") {
+    options->runtime.soundbox.wakeup_ack_texts.clear();
+    return true;
+  }
   return false;
 }
 
@@ -429,6 +436,12 @@ void ApplyConfigSequenceEntry(PipelineOptions* options,
   if (key == "soundbox.native_kws_triggers") {
     if (!value.empty()) {
       options->runtime.soundbox.native_kws_triggers.push_back(value);
+    }
+    return;
+  }
+  if (key == "soundbox.wakeup_ack_texts") {
+    if (!value.empty()) {
+      options->runtime.soundbox.wakeup_ack_texts.push_back(value);
     }
     return;
   }
@@ -460,8 +473,12 @@ void ApplyConfigEntry(PipelineOptions* options,
     options->runtime.soundbox.llm_stop_timeout_ms = ParseInt(value, key);
   } else if (key == "soundbox.native_kws_triggers") {
     options->runtime.soundbox.native_kws_triggers = ParseStringList(value);
+  } else if (key == "soundbox.wakeup_ack_texts") {
+    options->runtime.soundbox.wakeup_ack_texts = ParseStringList(value);
   } else if (key == "wakeup.say_hello") {
     options->runtime.wakeup.say_hello = value;
+    options->runtime.soundbox.wakeup_ack_texts =
+        value.empty() ? std::vector<std::string>{} : std::vector<std::string>{value};
   } else if (key == "wakeup.keywords_file") {
     options->runtime.wakeup.keywords_file = value;
   } else if (key == "wakeup.tokens_path") {

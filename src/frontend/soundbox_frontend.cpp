@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <thread>
 
@@ -202,7 +203,8 @@ ControlMessage ParseControlMessageLine(const std::string& line,
 // 前端构造函数：存储选项并校验必填 Unix socket 路径非空
 // options：前端初始化选项
 // 异常：任一 socket 路径为空时抛出 std::runtime_error
-Frontend::Frontend(Options options) : options_(std::move(options)) {
+Frontend::Frontend(Options options)
+    : options_(std::move(options)), wakeup_ack_rng_(std::random_device{}()) {
   if (options_.kws_socket_path.empty() || options_.aec_socket_path.empty()) {
     throw std::runtime_error("frontend socket paths must not be empty");
   }
@@ -583,6 +585,7 @@ void Frontend::HandleSessionStart(const Event& event) {
   // 进入会话启动中状态
   SetState(State::kSessionStarting,
            event.reason.empty() ? "session_start" : event.reason.c_str());
+  SendWakeupAck(event);
   // 按 xiaozhi 命令通道协议发送 session_start JSON line。
   const std::string reason = event.reason.empty() ? "kws_hit" : event.reason;
   if (!llm_client_ || !llm_client_->SendSessionStart(reason, event.score,
@@ -598,6 +601,31 @@ void Frontend::HandleSessionStart(const Event& event) {
   }
   // LLM raw 通道启用失败：回到空闲状态继续等待下一次唤醒
   SetState(State::kSessionStopped, "llm_start_failed");
+}
+
+// 从配置的唤醒确认候选文本里随机取一个；配置为空时回退为“在”。
+std::string Frontend::NextWakeupAckText() {
+  const auto& texts = options_.soundbox_config.soundbox.wakeup_ack_texts;
+  if (texts.empty()) {
+    return "在";
+  }
+  std::uniform_int_distribution<std::size_t> dist(0, texts.size() - 1);
+  return texts[dist(wakeup_ack_rng_)];
+}
+
+// KWS 命中后向客户端播报一条唤醒确认文本。播报失败不影响 session_start 主流程。
+void Frontend::SendWakeupAck(const Event& event) {
+  if (!client_) {
+    return;
+  }
+  const std::string text = NextWakeupAckText();
+  if (text.empty()) {
+    return;
+  }
+  if (!client_->SpeakText(text)) {
+    kLog->warn("failed to send wakeup ack text='{}' reason={} source={}", text,
+               event.reason, event.source);
+  }
 }
 
 // SoundBox 设备自身 KWS 唤醒事件：仅在 kSessionStarted 中作为打断当前

@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <sys/types.h>
 #include <thread>
@@ -154,6 +155,10 @@ class Frontend {
   void HandleSessionStop(const Event& event);
   // SoundBox 原生 KWS 打断当前会话：先向 xiaozhi 主动发送 session_end，再走本地 session_stop。
   void HandleSoundboxNativeKws(const Event& event);
+  // 从配置的唤醒确认候选文本里随机取一个；配置为空时回退为“在”。
+  std::string NextWakeupAckText();
+  // KWS 命中后向客户端播报一条唤醒确认文本；失败只记录日志，不阻断启动流程。
+  void SendWakeupAck(const Event& event);
   void StopSessionBySoundboxNativeKws(const Event& event);
   // 完成已经进入 kSessionStopping 后的本地 session_stop 清理。
   void FinishSessionStop(const char* reason);
@@ -191,6 +196,7 @@ class Frontend {
   std::atomic<bool> playback_enabled_{false};        // 数据面门控：是否允许播放 xiaozhi 下行 PCM
   std::atomic<uint64_t> soundbox_generation_{0};      // SoundBox 客户端代际，用于丢弃旧连接的异步回调
   std::atomic<uint64_t> kws_generation_{0};           // KWS 控制 socket 代际，用于丢弃旧连接的异步事件
+  std::mt19937 wakeup_ack_rng_;                       // 唤醒确认文本随机数引擎，只在事件线程使用
   std::atomic<bool> stop_requested_{false};  // 停止请求标志，原子变量保证多线程可见性
 };
 

@@ -39,6 +39,8 @@ struct SoundBoxPreset {
   int llm_start_timeout_ms{1000};
   // llm_stop_timeout_ms 是发送 llm_stop 后等待 llm_stop_ok 的最长时间。
   int llm_stop_timeout_ms{1000};
+  // wakeup_ack_texts 是 KWS 唤醒成功后发给客户端播报的候选提示文本。
+  std::vector<std::string> wakeup_ack_texts{"在", "哎"};
   // native_kws_triggers 是 SoundBox 原生识别文本可触发 soundbox-server KWS 的后缀词列表。
   std::vector<std::string> native_kws_triggers{"小杜老师", "小度老师"};
 };
@@ -91,10 +93,10 @@ struct VadPreset {
   int pre_roll_ms{300};
 };
 
-// 描述唤醒词模型与唤醒成功后的提示文案。
+// 描述唤醒词模型参数。
 struct Wakeup {
-  // say_hello 是唤醒成功后通过小爱音箱播报的提示文本。
-  std::string say_hello{"在"};
+  // say_hello 是旧配置项；新配置使用 soundbox.wakeup_ack_texts。
+  std::string say_hello;
   // keywords_file 是 sherpa-onnx KWS 关键词文件路径。
   std::string keywords_file{"assets/keywords.txt"};
   // tokens_path 是 KWS 模型使用的 token 表路径。

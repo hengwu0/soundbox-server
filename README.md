@@ -234,6 +234,10 @@ soundbox:
   connect_timeout_ms: 10000
   llm_start_timeout_ms: 1000
   llm_stop_timeout_ms: 1000
+  # KWS 唤醒成功后随机选择一条发给 open-xiaoai-client 播报。
+  wakeup_ack_texts:
+    - "在"
+    - "哎"
   # SoundBox 原生识别文本去除符号后，如果以后缀形式完全匹配这里的任一词，
   # 会复用 soundbox-server 本地 KWS session_start 流程。
   native_kws_triggers:
@@ -242,7 +246,6 @@ soundbox:
     # - "小度老师"
 
 wakeup:
-  say_hello: "在"
   keywords_file: "assets/keywords.txt"
   tokens_path: "assets/tokens.txt"
   encoder_path: "assets/encoder.onnx"

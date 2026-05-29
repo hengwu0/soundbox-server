@@ -311,6 +311,17 @@ class MockSoundboxWebSocketServer {
     return std::find(commands_.begin(), commands_.end(), command) != commands_.end();
   }
 
+  bool SawCommandPayloadContaining(const std::string& command,
+                                   const std::string& needle) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& item : command_payloads_) {
+      if (item.first == command && item.second.find(needle) != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool SawPlayPacket() const {
     std::lock_guard<std::mutex> lock(mu_);
     return saw_play_packet_;
@@ -392,9 +403,16 @@ class MockSoundboxWebSocketServer {
 
     const std::string id = request_it->value("id", std::string());
     const std::string command = request_it->value("command", std::string());
+    std::string payload_text;
+    const auto payload_it = request_it->find("payload");
+    if (payload_it != request_it->end()) {
+      payload_text =
+          payload_it->is_string() ? payload_it->get<std::string>() : payload_it->dump();
+    }
     {
       std::lock_guard<std::mutex> lock(mu_);
       commands_.push_back(command);
+      command_payloads_.emplace_back(command, payload_text);
     }
 
     nlohmann::json response = {
@@ -408,6 +426,7 @@ class MockSoundboxWebSocketServer {
   ix::WebSocketServer server_;
   mutable std::mutex mu_;
   std::vector<std::string> commands_;
+  std::vector<std::pair<std::string, std::string>> command_payloads_;
   bool saw_play_packet_{false};
   bool saw_authorization_header_{false};
 };
@@ -1418,6 +1437,7 @@ static void TestSoundboxNativeTextKwsTriggersSessionStart() {
   options.soundbox_config.soundbox.ws_token = "mock-token";
   options.soundbox_config.soundbox.connect_timeout_ms = 3000;
   options.soundbox_config.soundbox.native_kws_triggers = {"小杜老师", "小度老师"};
+  options.soundbox_config.soundbox.wakeup_ack_texts = {"在"};
   options.llm_client = shared_llm;
 
   Frontend frontend(options);
@@ -1443,6 +1463,10 @@ static void TestSoundboxNativeTextKwsTriggersSessionStart() {
     Require(WaitUntil([&] { return mock_soundbox.SawCommand("xiaoai_exit"); },
                       std::chrono::seconds(5)),
             "native text trigger should notify open-xiaoai-client to exit XiaoAI first");
+    Require(WaitUntil([&] {
+              return mock_soundbox.SawCommandPayloadContaining("run_shell", "在");
+            }, std::chrono::seconds(5)),
+            "native text trigger should send configured wakeup ack text");
     Require(WaitUntil([&] { return mock_soundbox.SawCommand("llm_start"); },
                       std::chrono::seconds(5)),
             "native text trigger should reuse KWS flow and call llm_start");
@@ -1742,6 +1766,9 @@ static void TestParseOptionsLoadsNativeKwsTriggers() {
                   "soundbox:\n"
                   "  ws_url: \"ws://127.0.0.1:4399/\"\n"
                   "  ws_token: \"token\"\n"
+                  "  wakeup_ack_texts:\n"
+                  "    - \"在\"\n"
+                  "    - \"哎\"\n"
                   "  native_kws_triggers:\n"
                   "    - \"小杜老师\"\n"
                   "    - \"小度老师\"\n"
@@ -1753,6 +1780,12 @@ static void TestParseOptionsLoadsNativeKwsTriggers() {
                   "  joiner_path: \"assets/joiner.onnx\"\n");
 
   const auto options = ParseOptions({"soundbox-server", "--config", config_file.string()});
+  Require(options.runtime.soundbox.wakeup_ack_texts.size() == 2,
+          "wakeup_ack_texts should load YAML sequence entries");
+  Require(options.runtime.soundbox.wakeup_ack_texts[0] == "在",
+          "first wakeup ack text should match config");
+  Require(options.runtime.soundbox.wakeup_ack_texts[1] == "哎",
+          "second wakeup ack text should match config");
   Require(options.runtime.soundbox.native_kws_triggers.size() == 2,
           "native_kws_triggers should load YAML sequence entries");
   Require(options.runtime.soundbox.native_kws_triggers[0] == "小杜老师",
