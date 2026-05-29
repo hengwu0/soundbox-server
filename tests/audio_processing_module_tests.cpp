@@ -1776,69 +1776,61 @@ static void TestPreAecAutoGainRaisesSmallMicFrameWithoutClipping() {
 }
 
 int main() {
-  try {
-    std::cerr << "[ RUN      ] TestStereoFrameSplitKeepsMicAndReferenceOrder\n";
-    TestStereoFrameSplitKeepsMicAndReferenceOrder();
-    std::cerr << "[ RUN      ] TestNewPipelineModulesExposeExpectedSocketRoles\n";
-    TestNewPipelineModulesExposeExpectedSocketRoles();
-    std::cerr << "[ RUN      ] TestAecFilePipelineMatchesExpectedWavMd5\n";
-    TestAecFilePipelineMatchesExpectedWavMd5();
-    std::cerr << "[ RUN      ] TestAecFilePipelineMatchesExpectedWavMd5Gushi\n";
-    TestAecFilePipelineMatchesExpectedWavMd5Gushi();
-    std::cerr << "[ RUN      ] TestAecFilePipelineMatchesExpectedWavMd5Music\n";
-    TestAecFilePipelineMatchesExpectedWavMd5Music();
-    std::cerr << "[ RUN      ] TestAecStreamProcessorReacceptsFrontendClient\n";
-    TestAecStreamProcessorReacceptsFrontendClient();
-    std::cerr << "[ RUN      ] TestAecStreamProcessorCallsAudioSinkWithProcessedPcm\n";
-    TestAecStreamProcessorCallsAudioSinkWithProcessedPcm();
-    std::cerr << "[ RUN      ] TestLlmClientConnectsToTcpServerAndReceivesSessionEnd\n";
-    TestLlmClientConnectsToTcpServerAndReceivesSessionEnd();
-    std::cerr << "[ RUN      ] TestKwsSocketServerSendsSessionStartJsonLine\n";
-    TestKwsSocketServerSendsSessionStartJsonLine();
-    std::cerr << "[ RUN      ] TestKwsZipformerDetectsWakeWordFromFile\n";
-    TestKwsZipformerDetectsWakeWordFromFile();
-    std::cerr << "[ RUN      ] TestKwsZipformerRejectsNonWakeWordFromFile\n";
-    TestKwsZipformerRejectsNonWakeWordFromFile();
-    std::cerr << "[ RUN      ] TestSoundboxAudioRouterRoutesOnlyCurrentMode\n";
-    TestSoundboxAudioRouterRoutesOnlyCurrentMode();
-    std::cerr << "[ RUN      ] TestPlaybackPcmBuildsTagPlayBinaryPayload\n";
-    TestPlaybackPcmBuildsTagPlayBinaryPayload();
-    std::cerr << "[ RUN      ] TestFrontendControlMessageParserRequiresTypedJsonFields\n";
-    TestFrontendControlMessageParserRequiresTypedJsonFields();
-    std::cerr << "[ RUN      ] TestFrontendControlSocketDisconnectsReconnect\n";
-    TestFrontendControlSocketDisconnectsReconnect();
-    std::cerr << "[ RUN      ] TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay\n";
-    TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay();
-    std::cerr << "[ RUN      ] TestSoundboxNativeKwsStopsStartedSession\n";
-    TestSoundboxNativeKwsStopsStartedSession();
-    std::cerr << "[ RUN      ] TestFrontendMockSoundboxSmokeLoop\n";
-    TestFrontendMockSoundboxSmokeLoop();
-    std::cerr << "[ RUN      ] TestWavWriterPatchesHeaderAfterStreamingSamples\n";
-    TestWavWriterPatchesHeaderAfterStreamingSamples();
-    std::cerr << "[ RUN      ] TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory\n";
-    TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory();
-    std::cerr << "[ RUN      ] TestParseOptionsLoadsConfigurationFromDirectory\n";
-    TestParseOptionsLoadsConfigurationFromDirectory();
-    std::cerr << "[ RUN      ] TestParseOptionsRejectsRemovedTuningFlags\n";
-    TestParseOptionsRejectsRemovedTuningFlags();
-    std::cerr << "[ RUN      ] TestParseOptionsLoadsSoundboxControlTimeouts\n";
-    TestParseOptionsLoadsSoundboxControlTimeouts();
-    std::cerr << "[ RUN      ] TestParseOptionsLoadsCommandAndLlmConfig\n";
-    TestParseOptionsLoadsCommandAndLlmConfig();
-    std::cerr << "[ RUN      ] TestRunPipelineRejectsMissingSoundboxUrl\n";
-    TestRunPipelineRejectsMissingSoundboxUrl();
-    std::cerr << "[ RUN      ] TestRunPipelineRejectsMissingSoundboxToken\n";
-    TestRunPipelineRejectsMissingSoundboxToken();
-    std::cerr << "[ RUN      ] TestRunPipelineStopsImmediatelyOnFatalWorkerError\n";
-    TestRunPipelineStopsImmediatelyOnFatalWorkerError();
-    std::cerr << "[ RUN      ] TestConfiguredLoggerWritesFileAndRuntimeSourcesUseIt\n";
-    TestConfiguredLoggerWritesFileAndRuntimeSourcesUseIt();
-    std::cerr << "[ RUN      ] TestPreAecAutoGainRaisesSmallMicFrameWithoutClipping\n";
-    TestPreAecAutoGainRaisesSmallMicFrameWithoutClipping();
-    std::cerr << "[       OK ] All tests passed.\n";
-  } catch (const std::exception& error) {
-    std::cerr << "Test failed: " << error.what() << '\n';
+  const std::vector<std::pair<std::string, void (*)()>> tests = {
+      {"TestStereoFrameSplitKeepsMicAndReferenceOrder", TestStereoFrameSplitKeepsMicAndReferenceOrder},
+      {"TestNewPipelineModulesExposeExpectedSocketRoles", TestNewPipelineModulesExposeExpectedSocketRoles},
+      {"TestAecFilePipelineMatchesExpectedWavMd5", TestAecFilePipelineMatchesExpectedWavMd5},
+      {"TestAecFilePipelineMatchesExpectedWavMd5Gushi", TestAecFilePipelineMatchesExpectedWavMd5Gushi},
+      {"TestAecFilePipelineMatchesExpectedWavMd5Music", TestAecFilePipelineMatchesExpectedWavMd5Music},
+      {"TestAecStreamProcessorReacceptsFrontendClient", TestAecStreamProcessorReacceptsFrontendClient},
+      {"TestAecStreamProcessorCallsAudioSinkWithProcessedPcm", TestAecStreamProcessorCallsAudioSinkWithProcessedPcm},
+      {"TestLlmClientConnectsToTcpServerAndReceivesSessionEnd", TestLlmClientConnectsToTcpServerAndReceivesSessionEnd},
+      {"TestKwsSocketServerSendsSessionStartJsonLine", TestKwsSocketServerSendsSessionStartJsonLine},
+      {"TestKwsZipformerDetectsWakeWordFromFile", TestKwsZipformerDetectsWakeWordFromFile},
+      {"TestKwsZipformerRejectsNonWakeWordFromFile", TestKwsZipformerRejectsNonWakeWordFromFile},
+      {"TestSoundboxAudioRouterRoutesOnlyCurrentMode", TestSoundboxAudioRouterRoutesOnlyCurrentMode},
+      {"TestPlaybackPcmBuildsTagPlayBinaryPayload", TestPlaybackPcmBuildsTagPlayBinaryPayload},
+      {"TestFrontendControlMessageParserRequiresTypedJsonFields", TestFrontendControlMessageParserRequiresTypedJsonFields},
+      {"TestFrontendControlSocketDisconnectsReconnect", TestFrontendControlSocketDisconnectsReconnect},
+      {"TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay", TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay},
+      {"TestSoundboxNativeKwsStopsStartedSession", TestSoundboxNativeKwsStopsStartedSession},
+      {"TestFrontendMockSoundboxSmokeLoop", TestFrontendMockSoundboxSmokeLoop},
+      {"TestWavWriterPatchesHeaderAfterStreamingSamples", TestWavWriterPatchesHeaderAfterStreamingSamples},
+      {"TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory", TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory},
+      {"TestParseOptionsLoadsConfigurationFromDirectory", TestParseOptionsLoadsConfigurationFromDirectory},
+      {"TestParseOptionsRejectsRemovedTuningFlags", TestParseOptionsRejectsRemovedTuningFlags},
+      {"TestParseOptionsLoadsSoundboxControlTimeouts", TestParseOptionsLoadsSoundboxControlTimeouts},
+      {"TestParseOptionsLoadsCommandAndLlmConfig", TestParseOptionsLoadsCommandAndLlmConfig},
+      {"TestRunPipelineRejectsMissingSoundboxUrl", TestRunPipelineRejectsMissingSoundboxUrl},
+      {"TestRunPipelineRejectsMissingSoundboxToken", TestRunPipelineRejectsMissingSoundboxToken},
+      {"TestRunPipelineStopsImmediatelyOnFatalWorkerError", TestRunPipelineStopsImmediatelyOnFatalWorkerError},
+      {"TestConfiguredLoggerWritesFileAndRuntimeSourcesUseIt", TestConfiguredLoggerWritesFileAndRuntimeSourcesUseIt},
+      {"TestPreAecAutoGainRaisesSmallMicFrameWithoutClipping", TestPreAecAutoGainRaisesSmallMicFrameWithoutClipping},
+  };
+
+  size_t passed = 0;
+  size_t failed = 0;
+  for (const auto& [name, test] : tests) {
+    std::cerr << "[ RUN      ] " << name << '\n';
+    try {
+      test();
+      ++passed;
+      std::cerr << "[       OK ] " << name << '\n';
+    } catch (const std::exception& error) {
+      ++failed;
+      std::cerr << "[  FAILED  ] " << name << ": " << error.what() << '\n';
+    } catch (...) {
+      ++failed;
+      std::cerr << "[  FAILED  ] " << name << ": unknown exception" << '\n';
+    }
+  }
+
+  std::cerr << "[==========] " << tests.size() << " tests ran." << '\n';
+  std::cerr << "[  PASSED  ] " << passed << " tests." << '\n';
+  if (failed > 0) {
+    std::cerr << "[  FAILED  ] " << failed << " tests." << '\n';
     return EXIT_FAILURE;
   }
+  std::cerr << "[       OK ] All tests passed." << '\n';
   return EXIT_SUCCESS;
 }
