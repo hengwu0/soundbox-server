@@ -74,6 +74,10 @@ class SoundBoxClient {
   // LLM 会话结束后请求客户端切回 KWS 单声道模式。
   bool NotifyLlmStop();
 
+  // 通知 open-xiaoai-client 退出小爱原生会话。
+  // 这是一次性 fire-and-forget 控制命令，不等待 Response。
+  void NotifyXiaoaiExit();
+
   // 返回当前音频模式，供 App 判断处理路径和日志定位。
   AudioMode CurrentMode() const;
 
@@ -108,6 +112,9 @@ class SoundBoxClient {
   bool Call(const std::string& command, const nlohmann::json& payload,
             std::chrono::milliseconds timeout, nlohmann::json* out_response,
             bool recovery = false);
+
+  // 发送一次性控制请求，不等待 Response。
+  bool SendRequestNoWait(const std::string& command, const nlohmann::json& payload);
 
   // 根据命令名执行幂等检查。
   CommandGuardDecision PrepareCommand(const std::string& command, bool recovery);

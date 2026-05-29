@@ -1440,6 +1440,9 @@ static void TestSoundboxNativeTextKwsTriggersSessionStart() {
               return mock_llm.SawSessionStartReason("soundbox_native_text_kws");
             }, std::chrono::seconds(5)),
             "native text trigger should send session_start with soundbox_native_text_kws reason");
+    Require(WaitUntil([&] { return mock_soundbox.SawCommand("xiaoai_exit"); },
+                      std::chrono::seconds(5)),
+            "native text trigger should notify open-xiaoai-client to exit XiaoAI first");
     Require(WaitUntil([&] { return mock_soundbox.SawCommand("llm_start"); },
                       std::chrono::seconds(5)),
             "native text trigger should reuse KWS flow and call llm_start");

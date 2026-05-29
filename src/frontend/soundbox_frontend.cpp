@@ -573,6 +573,13 @@ void Frontend::HandleSessionStart(const Event& event) {
     return;
   }
 
+  if (event.reason == "soundbox_native_text_kws") {
+    kLog->info("notify xiaoai exit before soundbox native text KWS session_start");
+    if (client_) {
+      client_->NotifyXiaoaiExit();
+    }
+  }
+
   // 进入会话启动中状态
   SetState(State::kSessionStarting,
            event.reason.empty() ? "session_start" : event.reason.c_str());

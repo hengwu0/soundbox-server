@@ -135,7 +135,7 @@ Frontend 状态机采用单线程事件队列串行流转：KWS 控制线程、x
 |---------|------|---------|------|
 | kSessionInit | frontend_ready / reconnect_ok | kSessionStopped | SoundBox 链路与本地 socket 就绪，进入空闲状态 |
 | kSessionStopped | session_start (kws_hit) | kSessionStarting | soundbox-server 本地 KWS 唤醒命中 |
-| kSessionStopped | session_start (soundbox_native_text_kws) | kSessionStarting | SoundBox 原生最终识别文本去除符号后，后缀命中 `soundbox.native_kws_triggers` |
+| kSessionStopped | session_start (soundbox_native_text_kws) | kSessionStarting | SoundBox 原生最终识别文本去除符号后，后缀命中 `soundbox.native_kws_triggers`；先发送 `xiaoai_exit` 让 open-xiaoai-client 退出小爱原生会话 |
 | kSessionStarting | xiaozhi session_start 已发送且 llm_start_ok | kSessionStarted | xiaozhi 会话启动，SoundBox 切换到 LLM raw 模式成功 |
 | kSessionStarting | soundbox_native_kws | 队列中等待 | 状态机正在处理启动事件，不插队；启动完成进入 kSessionStarted 后再处理该事件并立刻停止 |
 | kSessionStarting | llm_start_failed/timeout | kSessionStopped | 切换失败，回退等待下一次唤醒 |
@@ -301,7 +301,7 @@ log:
 
 需要以监听模式启动 `open-xiaoai-client`，并将生成的监听码（listen code）填入 `soundbox.ws_token`。同时需要将音箱的 WebSocket 地址填入 `soundbox.ws_url`（格式必须为 `ws://` 或 `wss://` 开头）。
 
-`soundbox.native_kws_triggers` 用于把 SoundBox 原生最终识别文本桥接成 soundbox-server 的 KWS 事件。匹配前会去除空白、标点和常见符号，然后要求识别文本以后缀形式完全匹配某个配置词；命中后投递 `session_start`，`reason` 为 `soundbox_native_text_kws`。例如配置 `小杜老师` 后，`小杜老师。`、`打开小杜老师` 会命中，`小杜老师在吗` 不会命中。
+`soundbox.native_kws_triggers` 用于把 SoundBox 原生最终识别文本桥接成 soundbox-server 的 KWS 事件。匹配前会去除空白、标点和常见符号，然后要求识别文本以后缀形式完全匹配某个配置词；命中后投递 `session_start`，`reason` 为 `soundbox_native_text_kws`。在真正进入 xiaozhi 会话前，soundbox-server 会先向 open-xiaoai-client 发送一次性 `xiaoai_exit` 请求，让小爱原生会话退出；该请求不阻塞等待 Response，若后续收到 Response 仅记录日志。例如配置 `小杜老师` 后，`小杜老师。`、`打开小杜老师` 会命中，`小杜老师在吗` 不会命中。
 
 ```sh
 open-xiaoai-client -l

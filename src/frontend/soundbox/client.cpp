@@ -259,6 +259,13 @@ bool SoundBoxClient::NotifyLlmStart() {
   return false;
 }
 
+// 通知 open-xiaoai-client 退出小爱原生会话。
+void SoundBoxClient::NotifyXiaoaiExit() {
+  if (!SendRequestNoWait("xiaoai_exit", nullptr)) {
+    kLog->warn("failed to send xiaoai_exit request");
+  }
+}
+
 // 请求退出 LLM raw 音频模式。
 bool SoundBoxClient::NotifyLlmStop() {
   const auto decision = command_guard_.PrepareLlmStop(mode_controller_);
@@ -546,8 +553,9 @@ bool SoundBoxClient::Call(const std::string& command, const nlohmann::json& payl
   if (out_response) {
     *out_response = *response;
   }
-  kLog->debug("rx soundbox response id={} code={} msg={} cost_ms={} mode={}", request_id,
-              response->value("code", 0), response->value("msg", std::string()), cost_ms,
+  kLog->debug("rx soundbox response id={} command={} code={} msg={} cost_ms={} mode={}",
+              request_id, command, response->value("code", 0),
+              response->value("msg", std::string()), cost_ms,
               AudioModeName(mode_controller_.Current()));
 
   const auto code = response->find("code");
@@ -557,6 +565,32 @@ bool SoundBoxClient::Call(const std::string& command, const nlohmann::json& payl
     return false;
   }
   return true;
+}
+
+// 发送一次性控制请求，不等待 Response。
+bool SoundBoxClient::SendRequestNoWait(const std::string& command,
+                                       const nlohmann::json& payload) {
+  if (!EnsureConnection(std::chrono::milliseconds(cfg_.soundbox.connect_timeout_ms))) {
+    unknown_logger_.Log(spdlog::level::warn, "send-connection-not-ready",
+                        "[soundbox] send no-wait request skipped because connection is not ready");
+    return false;
+  }
+
+  const std::string request_id = NextId();
+  nlohmann::json request = {
+      {"Request",
+       {
+           {"id", request_id},
+           {"command", command},
+       }},
+  };
+  if (!payload.is_null()) {
+    request["Request"]["payload"] = payload;
+  }
+
+  kLog->debug("tx soundbox no-wait request id={} command={} mode={}", request_id, command,
+              AudioModeName(mode_controller_.Current()));
+  return SendText(request.dump());
 }
 
 // 生成命令幂等决策。
@@ -666,6 +700,16 @@ void SoundBoxClient::HandleMessageFrame(bool binary, const std::string& payload)
   switch (packet.type) {
     case PacketType::Response:
       kLog->debug("{}", internal::SoundboxJsonDebugLog("[SOUNDBOX][RAW]", payload));
+      if (packet.command == "xiaoai_exit") {
+        const int code = packet.json.value("code", 0);
+        const std::string msg = packet.json.value("msg", std::string());
+        if (code == 0) {
+          kLog->info("xiaoai_exit response ok id={} msg={}", packet.id, msg);
+        } else {
+          kLog->warn("xiaoai_exit response failed id={} code={} msg={}", packet.id, code, msg);
+        }
+        break;
+      }
       response_hub_.Notify(packet.json);
       break;
     case PacketType::Event:
