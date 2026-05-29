@@ -69,10 +69,35 @@ endfunction()
 function(require_archive_from_downloads section out_archive)
   read_download_entry("${section}" archive _archive)
   read_download_entry("${section}" sha256 _expected_sha256)
+  read_download_entry("${section}" url _download_url)
 
-  set(_archive_path "${THIRD_PARTY_ROOT}/archives/${_archive}")
+  set(_archives_dir "${THIRD_PARTY_ROOT}/archives")
+  set(_archive_path "${_archives_dir}/${_archive}")
+
   if(NOT EXISTS "${_archive_path}")
-    message(FATAL_ERROR "missing third-party archive: ${_archive_path}")
+    file(MAKE_DIRECTORY "${_archives_dir}")
+    set(_tmp_archive_path "${_archive_path}.download")
+    file(REMOVE "${_tmp_archive_path}")
+
+    message(STATUS "Missing third-party archive ${_archive}; downloading from ${_download_url}")
+    file(DOWNLOAD
+      "${_download_url}"
+      "${_tmp_archive_path}"
+      SHOW_PROGRESS
+      TLS_VERIFY ON
+      STATUS _download_status
+    )
+    list(GET _download_status 0 _download_status_code)
+    list(GET _download_status 1 _download_status_message)
+    if(NOT _download_status_code EQUAL 0)
+      file(REMOVE "${_tmp_archive_path}")
+      message(FATAL_ERROR
+        "failed to download ${_archive} from ${_download_url}: ${_download_status_message}"
+      )
+    endif()
+    file(RENAME "${_tmp_archive_path}" "${_archive_path}")
+  else()
+    message(STATUS "Using cached third-party archive: ${_archive}")
   endif()
 
   file(SHA256 "${_archive_path}" _actual_sha256)

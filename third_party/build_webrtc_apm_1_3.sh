@@ -86,15 +86,50 @@ load_download_entry() {
   printf -v "${url_var}" '%s' "${archive_url}"
 }
 
+download_archive() {
+  local download_url="$1"
+  local output_file="$2"
+
+  mkdir -p "$(dirname "${output_file}")"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --show-error --output "${output_file}" "${download_url}"
+    return
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    wget --output-document="${output_file}" "${download_url}"
+    return
+  fi
+
+  python3 - "${download_url}" "${output_file}" <<'PY'
+import sys
+import urllib.request
+
+url, output_file = sys.argv[1:]
+with urllib.request.urlopen(url) as response, open(output_file, "wb") as f:
+    f.write(response.read())
+PY
+}
+
 verify_archive() {
   local archive="$1"
   local expected_sha256="$2"
   local download_url="$3"
 
   if [[ ! -f "${archive}" ]]; then
+    local tmp_archive="${archive}.download"
+    rm -f "${tmp_archive}"
     echo "Missing third-party archive: ${archive}" >&2
-    echo "Download it from: ${download_url}" >&2
-    exit 1
+    echo "Downloading from: ${download_url}" >&2
+    if ! download_archive "${download_url}" "${tmp_archive}"; then
+      rm -f "${tmp_archive}"
+      echo "Failed to download third-party archive: ${download_url}" >&2
+      exit 1
+    fi
+    mv "${tmp_archive}" "${archive}"
+  else
+    echo "Using cached third-party archive: ${archive}" >&2
   fi
 
   printf '%s  %s\n' "${expected_sha256}" "${archive}" | sha256sum -c - >&2

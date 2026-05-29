@@ -217,7 +217,7 @@ cmake --build .
 ctest --output-on-failure
 ```
 
-构建过程会从 `third_party/archives` 中准备并集成以下内置依赖：WebRTC APM、ixwebsocket、nlohmann_json、spdlog 和 sherpa-onnx。
+构建过程会优先从 `third_party/archives` 中准备并集成以下内置依赖：WebRTC APM、ixwebsocket、nlohmann_json、spdlog 和 sherpa-onnx。若某个源码包在 `third_party/archives` 中不存在，构建脚本才会根据 `third_party/downloads` 中记录的 URL 下载，并缓存回 `third_party/archives`。
 
 ## 运行指南
 
