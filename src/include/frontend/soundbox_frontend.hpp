@@ -122,11 +122,11 @@ class Frontend {
 
   // Frontend 控制面事件载荷。
   struct Event {
-    EventType type;
-    std::string reason;
-    std::string source;
-    std::optional<double> score;
-    std::optional<int64_t> timestamp_ms;
+    EventType type{};
+    std::string reason{};
+    std::string source{};
+    std::optional<double> score{};
+    std::optional<int64_t> timestamp_ms{};
   };
 
   // 启停 Frontend 控制面事件循环线程。
