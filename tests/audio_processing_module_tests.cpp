@@ -350,6 +350,21 @@ class MockSoundboxWebSocketServer {
     }
   }
 
+  void SendFinalRecognizeResult(const std::string& text) {
+    nlohmann::json instruction_line = {
+        {"header", {{"namespace", "SpeechRecognizer"}, {"name", "RecognizeResult"}}},
+        {"payload",
+         {{"is_vad_begin", false},
+          {"is_final", true},
+          {"results", nlohmann::json::array({{{"text", text}}})}}},
+    };
+    nlohmann::json event = {
+        {"event", "instruction"},
+        {"data", {{"NewLine", instruction_line.dump()}}},
+    };
+    SendToAll(event.dump(), false);
+  }
+
  private:
   void HandleMessage(ix::WebSocket& web_socket, const ix::WebSocketMessagePtr& message) {
     if (message->type == ix::WebSocketMessageType::Open) {
@@ -435,6 +450,10 @@ class MockLlmTcpServer {
   std::string host() const { return "127.0.0.1"; }
   size_t audio_bytes_received() const { return audio_bytes_received_.load(); }
   bool SawSessionStart() const { return saw_session_start_.load(); }
+  bool SawSessionStartReason(const std::string& reason) const {
+    std::lock_guard<std::mutex> lock(command_mu_);
+    return saw_session_start_.load() && session_start_reason_ == reason;
+  }
   bool SawSessionEnd(const std::string& reason, const std::string& source) const {
     std::lock_guard<std::mutex> lock(command_mu_);
     return saw_session_end_ && session_end_reason_ == reason && session_end_source_ == source;
@@ -568,7 +587,9 @@ class MockLlmTcpServer {
           if (!message.is_discarded()) {
             const std::string type = message.value("type", "");
             if (type == "session_start") {
+              std::lock_guard<std::mutex> lock(command_mu_);
               saw_session_start_.store(true);
+              session_start_reason_ = message.value("reason", std::string());
             } else if (type == "session_end") {
               std::lock_guard<std::mutex> lock(command_mu_);
               saw_session_end_ = true;
@@ -602,6 +623,7 @@ class MockLlmTcpServer {
   std::atomic<size_t> audio_bytes_received_{0};
   std::atomic<bool> saw_session_start_{false};
   mutable std::mutex command_mu_;
+  std::string session_start_reason_;
   bool saw_session_end_{false};
   std::string session_end_reason_;
   std::string session_end_source_;
@@ -1345,6 +1367,106 @@ static void TestSoundboxNativeKwsStopsStartedSession() {
   if (kws_error) std::rethrow_exception(kws_error);
 }
 
+// 测试 SoundBox 原生最终识别文本以后缀命中配置词后，复用本地 KWS 事件启动会话。
+static void TestSoundboxNativeTextKwsTriggersSessionStart() {
+  const std::filesystem::path temp_root = MakeTempDirectory("frontend_native_text_kws");
+  const std::string kws_socket = (temp_root / "frontend_kws.sock").string();
+  const std::string aec_socket = (temp_root / "frontend_aec.sock").string();
+
+  MockSoundboxWebSocketServer mock_soundbox;
+  MockLlmTcpServer mock_llm;
+  mock_llm.Start();
+
+  auto shared_llm = std::make_shared<LlmClient>(
+      LlmClientOptions{mock_llm.host(), mock_llm.port(), mock_llm.host(),
+                       mock_llm.command_port()},
+      [](const std::string&) {});
+  shared_llm->Connect();
+
+  std::atomic<bool> keep_servers_open{true};
+  std::exception_ptr kws_error;
+  std::thread kws_server_thread([&] {
+    try {
+      auto server = audio_processing_module::CreateUnixServerSocket(kws_socket, 1);
+      audio_processing_module::SocketPathGuard guard(kws_socket);
+      auto client = audio_processing_module::AcceptUnixClientWithTimeout(
+          server.get(), std::chrono::seconds(10));
+      while (keep_servers_open.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    } catch (...) {
+      kws_error = std::current_exception();
+    }
+  });
+
+  auto aec_server = audio_processing_module::CreateUnixServerSocket(aec_socket, 1);
+  audio_processing_module::SocketPathGuard aec_guard(aec_socket);
+  std::thread aec_server_thread([&] {
+    try {
+      auto client = audio_processing_module::AcceptUnixClientWithTimeout(
+          aec_server.get(), std::chrono::seconds(10));
+      while (keep_servers_open.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    } catch (...) {}
+  });
+
+  Frontend::Options options;
+  options.kws_socket_path = kws_socket;
+  options.aec_socket_path = aec_socket;
+  options.soundbox_config.soundbox.ws_url = mock_soundbox.url();
+  options.soundbox_config.soundbox.ws_token = "mock-token";
+  options.soundbox_config.soundbox.connect_timeout_ms = 3000;
+  options.soundbox_config.soundbox.native_kws_triggers = {"小杜老师", "小度老师"};
+  options.llm_client = shared_llm;
+
+  Frontend frontend(options);
+  std::exception_ptr frontend_error;
+  std::thread frontend_thread([&] {
+    try { frontend.Run(); }
+    catch (...) { frontend_error = std::current_exception(); }
+  });
+
+  try {
+    Require(WaitUntil([&] { return mock_soundbox.SawCommand("fast_recording"); },
+                      std::chrono::seconds(5)),
+            "frontend should finish soundbox startup");
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStopped; },
+                      std::chrono::seconds(5)),
+            "frontend should enter SessionStopped before native text trigger");
+
+    mock_soundbox.SendFinalRecognizeResult("打开，小杜老师！");
+    Require(WaitUntil([&] {
+              return mock_llm.SawSessionStartReason("soundbox_native_text_kws");
+            }, std::chrono::seconds(5)),
+            "native text trigger should send session_start with soundbox_native_text_kws reason");
+    Require(WaitUntil([&] { return mock_soundbox.SawCommand("llm_start"); },
+                      std::chrono::seconds(5)),
+            "native text trigger should reuse KWS flow and call llm_start");
+    Require(WaitUntil([&] { return frontend.state() == Frontend::State::kSessionStarted; },
+                      std::chrono::seconds(5)),
+            "native text trigger should move frontend to SessionStarted");
+  } catch (...) {
+    frontend.Stop();
+    keep_servers_open.store(false);
+    if (frontend_thread.joinable()) frontend_thread.join();
+    if (kws_server_thread.joinable()) kws_server_thread.join();
+    if (aec_server_thread.joinable()) aec_server_thread.join();
+    mock_llm.Stop();
+    throw;
+  }
+
+  frontend.Stop();
+  keep_servers_open.store(false);
+  frontend_thread.join();
+  kws_server_thread.join();
+  aec_server_thread.join();
+  mock_llm.Stop();
+  if (frontend_error) std::rethrow_exception(frontend_error);
+  if (kws_error) std::rethrow_exception(kws_error);
+}
+
+
 // 测试前端与模拟 Soundbox 完整交互流程：KWS → AEC → 恢复。
 static void TestFrontendMockSoundboxSmokeLoop() {
   const std::filesystem::path temp_root = MakeTempDirectory("frontend_smoke");
@@ -1607,6 +1729,35 @@ static void TestParseOptionsLoadsSoundboxControlTimeouts() {
           "llm_stop timeout should be loaded from config");
 }
 
+
+// 测试 ParseOptions 支持 YAML 列表配置 SoundBox 原生文本 KWS 触发词。
+static void TestParseOptionsLoadsNativeKwsTriggers() {
+  const std::filesystem::path temp_root = MakeTempDirectory("native_kws_triggers_config");
+  const std::filesystem::path config_file = temp_root / "apm.yaml";
+  WriteConfigFile(config_file,
+                  "socket_dir: \"/tmp/test-native-kws-triggers\"\n"
+                  "soundbox:\n"
+                  "  ws_url: \"ws://127.0.0.1:4399/\"\n"
+                  "  ws_token: \"token\"\n"
+                  "  native_kws_triggers:\n"
+                  "    - \"小杜老师\"\n"
+                  "    - \"小度老师\"\n"
+                  "wakeup:\n"
+                  "  keywords_file: \"assets/keywords.txt\"\n"
+                  "  tokens_path: \"assets/tokens.txt\"\n"
+                  "  encoder_path: \"assets/encoder.onnx\"\n"
+                  "  decoder_path: \"assets/decoder.onnx\"\n"
+                  "  joiner_path: \"assets/joiner.onnx\"\n");
+
+  const auto options = ParseOptions({"soundbox-server", "--config", config_file.string()});
+  Require(options.runtime.soundbox.native_kws_triggers.size() == 2,
+          "native_kws_triggers should load YAML sequence entries");
+  Require(options.runtime.soundbox.native_kws_triggers[0] == "小杜老师",
+          "first native KWS trigger should match config");
+  Require(options.runtime.soundbox.native_kws_triggers[1] == "小度老师",
+          "second native KWS trigger should match config");
+}
+
 // 测试 ParseOptions 加载 xiaozhi 命令通道和音频通道配置项。
 static void TestParseOptionsLoadsCommandAndLlmConfig() {
   const std::filesystem::path temp_root = MakeTempDirectory("command_llm_config");
@@ -1794,12 +1945,14 @@ int main() {
       {"TestFrontendControlSocketDisconnectsReconnect", TestFrontendControlSocketDisconnectsReconnect},
       {"TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay", TestFrontendXiaozhiDownlinkPlaybackForwardsTagPlay},
       {"TestSoundboxNativeKwsStopsStartedSession", TestSoundboxNativeKwsStopsStartedSession},
+      {"TestSoundboxNativeTextKwsTriggersSessionStart", TestSoundboxNativeTextKwsTriggersSessionStart},
       {"TestFrontendMockSoundboxSmokeLoop", TestFrontendMockSoundboxSmokeLoop},
       {"TestWavWriterPatchesHeaderAfterStreamingSamples", TestWavWriterPatchesHeaderAfterStreamingSamples},
       {"TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory", TestParseOptionsCreatesDefaultConfigInCurrentWorkingDirectory},
       {"TestParseOptionsLoadsConfigurationFromDirectory", TestParseOptionsLoadsConfigurationFromDirectory},
       {"TestParseOptionsRejectsRemovedTuningFlags", TestParseOptionsRejectsRemovedTuningFlags},
       {"TestParseOptionsLoadsSoundboxControlTimeouts", TestParseOptionsLoadsSoundboxControlTimeouts},
+      {"TestParseOptionsLoadsNativeKwsTriggers", TestParseOptionsLoadsNativeKwsTriggers},
       {"TestParseOptionsLoadsCommandAndLlmConfig", TestParseOptionsLoadsCommandAndLlmConfig},
       {"TestRunPipelineRejectsMissingSoundboxUrl", TestRunPipelineRejectsMissingSoundboxUrl},
       {"TestRunPipelineRejectsMissingSoundboxToken", TestRunPipelineRejectsMissingSoundboxToken},

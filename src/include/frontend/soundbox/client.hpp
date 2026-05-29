@@ -42,6 +42,9 @@ class SoundBoxClient {
     std::function<void(const std::string&)> on_connection_closed;
     // on_soundbox_native_kws 在 soundbox 设备自身 KWS 唤醒事件上报时调用。
     std::function<void()> on_soundbox_native_kws;
+    // on_soundbox_native_text_kws 在原生识别文本命中 native_kws_triggers 时调用。
+    std::function<void(const std::string& text, const std::string& trigger)>
+        on_soundbox_native_text_kws;
   };
 
   // 构造 soundbox 客户端。
@@ -123,6 +126,10 @@ class SoundBoxClient {
 
   // 异步分发 soundbox 原生 KWS 事件，避免在 ixwebsocket 回调线程里执行阻塞 RPC。
   void DispatchSoundboxNativeKwsCallback();
+
+  // 分发 soundbox 原生文本触发的 KWS 事件；上层只投递 Frontend 事件，不直接做阻塞 RPC。
+  void DispatchSoundboxNativeTextKwsCallback(const std::string& text,
+                                             const std::string& trigger);
 
   // 生成请求 ID。
   static std::string NextId();

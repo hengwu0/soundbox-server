@@ -4,6 +4,9 @@
 #include "frontend/soundbox/packet.hpp"
 
 #include <functional>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace xiaoai_server::soundbox {
 
@@ -19,12 +22,21 @@ class EventDispatcher {
  public:
   // soundbox 原生 KWS 唤醒事件回调。
   using OnSoundboxNativeKwsCallback = std::function<void()>;
+  // soundbox 原生识别文本命中 native_kws_triggers 后的回调。
+  using OnSoundboxNativeTextKwsCallback =
+      std::function<void(const std::string& text, const std::string& trigger)>;
 
   // 构造事件分发器。
   EventDispatcher();
 
   // 设置 soundbox 原生 KWS 唤醒事件回调。
   void set_soundbox_native_kws_callback(OnSoundboxNativeKwsCallback callback);
+
+  // 设置 soundbox 原生识别文本触发 KWS 的配置词列表。
+  void set_native_kws_triggers(std::vector<std::string> triggers);
+
+  // 设置 soundbox 原生识别文本触发 KWS 的回调。
+  void set_soundbox_native_text_kws_callback(OnSoundboxNativeTextKwsCallback callback);
 
   // 处理一条事件 Packet。
   //
@@ -35,10 +47,22 @@ class EventDispatcher {
   void Handle(const Packet& packet);
 
  private:
+  struct NativeKwsTrigger {
+    std::string raw;
+    std::string normalized;
+  };
+
+  // 命中配置触发词时返回原始 trigger，未命中返回 nullopt。
+  std::optional<std::string> MatchNativeTextKws(const std::string& text) const;
+
   // unknown_logger_ 聚合非关键 instruction 或未知事件日志。
   xiaoai_server::RateLimitedLogger unknown_logger_;
+  // native_kws_triggers_ 保存已归一化的 SoundBox 原生文本 KWS 触发词。
+  std::vector<NativeKwsTrigger> native_kws_triggers_;
   // on_soundbox_native_kws_ 在识别到 soundbox 设备自身 KWS 事件时通知上层。
   OnSoundboxNativeKwsCallback on_soundbox_native_kws_;
+  // on_soundbox_native_text_kws_ 在识别文本命中配置触发词时通知上层。
+  OnSoundboxNativeTextKwsCallback on_soundbox_native_text_kws_;
 };
 
 }  // namespace xiaoai_server::soundbox

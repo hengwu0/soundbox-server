@@ -126,8 +126,13 @@ SoundBoxClient::SoundBoxClient(config::Config cfg, Callbacks callbacks)
   };
   audio_router_ =
       std::make_unique<AudioRouter>(audio_pipe_, mode_controller_, std::move(router_callbacks));
+  event_dispatcher_.set_native_kws_triggers(cfg_.soundbox.native_kws_triggers);
   event_dispatcher_.set_soundbox_native_kws_callback(
       [this] { DispatchSoundboxNativeKwsCallback(); });
+  event_dispatcher_.set_soundbox_native_text_kws_callback(
+      [this](const std::string& text, const std::string& trigger) {
+        DispatchSoundboxNativeTextKwsCallback(text, trigger);
+      });
 }
 
 // 析构客户端并停止连接。
@@ -638,6 +643,21 @@ void SoundBoxClient::DispatchSoundboxNativeKwsCallback() {
     }
     running->store(false);
   }).detach();
+}
+
+// 分发 soundbox 原生文本触发的 KWS 事件。
+void SoundBoxClient::DispatchSoundboxNativeTextKwsCallback(
+    const std::string& text, const std::string& trigger) {
+  if (!callbacks_.on_soundbox_native_text_kws) {
+    return;
+  }
+  try {
+    callbacks_.on_soundbox_native_text_kws(text, trigger);
+  } catch (const std::exception& error) {
+    kLog->warn("soundbox native text KWS callback failed: {}", error.what());
+  } catch (...) {
+    kLog->warn("soundbox native text KWS callback failed with unknown error");
+  }
 }
 
 // 统一处理 WebSocket message 帧。

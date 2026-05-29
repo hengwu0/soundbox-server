@@ -294,6 +294,13 @@ void Frontend::Run() {
     }
     OnSoundboxNativeKws();
   };
+  callbacks.on_soundbox_native_text_kws =
+      [this, soundbox_generation](const std::string& text, const std::string& trigger) {
+        if (soundbox_generation != soundbox_generation_.load()) {
+          return;
+        }
+        OnSoundboxNativeTextKws(text, trigger);
+      };
   client_ = std::make_unique<xiaoai_server::soundbox::SoundBoxClient>(
       options_.soundbox_config, std::move(callbacks));
 
@@ -405,6 +412,13 @@ void Frontend::OnLlmSessionEnd(const std::string& reason) {
 // SoundBox 设备自身 KWS 唤醒事件回调：投递给 Frontend 控制面事件队列串行处理。
 void Frontend::OnSoundboxNativeKws() {
   PostEvent(Event{EventType::kSoundboxNativeKws, "soundbox_native_kws", "soundbox"});
+}
+
+// SoundBox 原生识别文本命中配置触发词后，复用本地 KWS session_start 事件。
+void Frontend::OnSoundboxNativeTextKws(const std::string& text,
+                                       const std::string& trigger) {
+  kLog->info("soundbox native text triggers KWS text={} trigger={}", text, trigger);
+  PostEvent(Event{EventType::kLocalKwsHit, "soundbox_native_text_kws", "soundbox"});
 }
 
 // KWS 控制通道读取线程主循环：
@@ -701,6 +715,13 @@ bool Frontend::RestartSoundboxAudioLink() {
       }
       OnSoundboxNativeKws();
     };
+    callbacks.on_soundbox_native_text_kws =
+        [this, soundbox_generation](const std::string& text, const std::string& trigger) {
+          if (soundbox_generation != soundbox_generation_.load()) {
+            return;
+          }
+          OnSoundboxNativeTextKws(text, trigger);
+        };
     client_ = std::make_unique<xiaoai_server::soundbox::SoundBoxClient>(
         options_.soundbox_config, std::move(callbacks));
 

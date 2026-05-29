@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace xiaoai_server::config {
 
@@ -38,6 +39,8 @@ struct SoundBoxPreset {
   int llm_start_timeout_ms{1000};
   // llm_stop_timeout_ms 是发送 llm_stop 后等待 llm_stop_ok 的最长时间。
   int llm_stop_timeout_ms{1000};
+  // native_kws_triggers 是 SoundBox 原生识别文本可触发 soundbox-server KWS 的后缀词列表。
+  std::vector<std::string> native_kws_triggers{"小杜老师", "小度老师"};
 };
 
 // 描述 xiaozhi 上游服务连接与音频协商参数。
@@ -206,3 +209,4 @@ struct Config {
 Config load(const std::string& path);
 
 }  // namespace xiaoai_server::config
+

@@ -106,6 +106,8 @@ class Frontend {
   void OnLlmSessionEnd(const std::string& reason);
   // SoundBox 设备自身 KWS 唤醒事件回调：投递给 Frontend 事件队列串行处理。
   void OnSoundboxNativeKws();
+  // SoundBox 原生识别文本命中配置触发词：复用本地 KWS session_start 事件。
+  void OnSoundboxNativeTextKws(const std::string& text, const std::string& trigger);
   // KWS 控制通道读取线程：循环读取 session_start 消息并投递 Frontend 控制事件
   void KwsControlReaderLoop();
 

@@ -2,6 +2,8 @@
 
 #include "common/log.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <utility>
 
 namespace xiaoai_server::soundbox {
@@ -10,6 +12,61 @@ namespace {
 
 // kLog 是事件层日志器。
 const auto kLog = xiaoai_server::GetLogger("soundbox");
+
+// 返回 UTF-8 当前位置编码的字节长度，非法字节按单字节处理。
+size_t Utf8CharLength(unsigned char lead) {
+  if ((lead & 0x80) == 0) {
+    return 1;
+  }
+  if ((lead & 0xE0) == 0xC0) {
+    return 2;
+  }
+  if ((lead & 0xF0) == 0xE0) {
+    return 3;
+  }
+  if ((lead & 0xF8) == 0xF0) {
+    return 4;
+  }
+  return 1;
+}
+
+// 判断一个 UTF-8 字符是否应在 native KWS 文本匹配前被去除。
+bool IsIgnoredNativeKwsSymbol(const std::string& ch) {
+  if (ch.size() == 1) {
+    const unsigned char value = static_cast<unsigned char>(ch[0]);
+    return std::isspace(value) || std::ispunct(value);
+  }
+
+  static const std::vector<std::string> kIgnoredSymbols = {
+      "，", "。", "！", "？", "；", "：", "、", "“", "”", "‘", "’",
+      "（", "）", "【", "】", "《", "》", "〈", "〉", "「", "」",
+      "『", "』", "〔", "〕", "—", "…", "·", "～", "￥", "＂",
+      "＇", "＃", "％", "＆", "＊", "＋", "－", "／", "＝", "＠",
+      "＼", "＾", "＿", "｀", "｜", "｛", "｝", "［", "］", "＜",
+      "＞", "＂", "＇", "　"};
+  return std::find(kIgnoredSymbols.begin(), kIgnoredSymbols.end(), ch) !=
+         kIgnoredSymbols.end();
+}
+
+// 归一化 SoundBox 原生识别文本：去除空白、标点和常见符号。
+std::string NormalizeNativeKwsText(const std::string& text) {
+  std::string normalized;
+  for (size_t pos = 0; pos < text.size();) {
+    const size_t char_len = std::min(Utf8CharLength(static_cast<unsigned char>(text[pos])),
+                                     text.size() - pos);
+    const std::string ch = text.substr(pos, char_len);
+    if (!IsIgnoredNativeKwsSymbol(ch)) {
+      normalized += ch;
+    }
+    pos += char_len;
+  }
+  return normalized;
+}
+
+bool EndsWith(const std::string& value, const std::string& suffix) {
+  return value.size() >= suffix.size() &&
+         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
 // 读取小爱 RecognizeResult 中第一条识别文本。
 std::string FirstResultText(const nlohmann::json& payload) {
@@ -36,6 +93,40 @@ EventDispatcher::EventDispatcher()
 void EventDispatcher::set_soundbox_native_kws_callback(
     OnSoundboxNativeKwsCallback callback) {
   on_soundbox_native_kws_ = std::move(callback);
+}
+
+// 设置 SoundBox 原生文本 KWS 触发词列表。
+void EventDispatcher::set_native_kws_triggers(std::vector<std::string> triggers) {
+  native_kws_triggers_.clear();
+  native_kws_triggers_.reserve(triggers.size());
+  for (auto& trigger : triggers) {
+    const std::string normalized = NormalizeNativeKwsText(trigger);
+    if (normalized.empty()) {
+      continue;
+    }
+    native_kws_triggers_.push_back(NativeKwsTrigger{std::move(trigger), normalized});
+  }
+}
+
+// 设置 SoundBox 原生文本 KWS 触发回调。
+void EventDispatcher::set_soundbox_native_text_kws_callback(
+    OnSoundboxNativeTextKwsCallback callback) {
+  on_soundbox_native_text_kws_ = std::move(callback);
+}
+
+// 判断识别文本是否以后缀形式命中任一配置触发词。
+std::optional<std::string> EventDispatcher::MatchNativeTextKws(
+    const std::string& text) const {
+  const std::string normalized = NormalizeNativeKwsText(text);
+  if (normalized.empty()) {
+    return std::nullopt;
+  }
+  for (const auto& trigger : native_kws_triggers_) {
+    if (EndsWith(normalized, trigger.normalized)) {
+      return trigger.raw;
+    }
+  }
+  return std::nullopt;
 }
 
 // 处理事件包。
@@ -103,7 +194,16 @@ void EventDispatcher::Handle(const Packet& packet) {
         on_soundbox_native_kws_();
       }
     } else if (is_final && !text.empty()) {
-      kLog->info("小爱收到指令: {}", text);
+      const auto matched_trigger = MatchNativeTextKws(text);
+      if (matched_trigger) {
+        kLog->info("小爱原生指令触发 soundbox-server KWS: text={} trigger={}",
+                   text, *matched_trigger);
+        if (on_soundbox_native_text_kws_) {
+          on_soundbox_native_text_kws_(text, *matched_trigger);
+        }
+      } else {
+        kLog->info("小爱收到指令: {}", text);
+      }
     } else {
       kLog->debug("小爱过程识别: final={} vad_begin={} text='{}'", is_final, is_vad_begin,
                   text);

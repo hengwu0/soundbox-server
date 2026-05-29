@@ -273,6 +273,34 @@ std::string Unquote(const std::string& value) {
   return value;
 }
 
+/// 将逗号分隔或 [a, b] 形式的配置值解析成字符串列表。
+/// @param value YAML 标量值。
+/// @return 去除空白和引号后的字符串列表，空项会被忽略。
+std::vector<std::string> ParseStringList(const std::string& value) {
+  std::string body = Trim(value);
+  if (body.size() >= 2 && body.front() == '[' && body.back() == ']') {
+    body = body.substr(1, body.size() - 2);
+  }
+
+  std::vector<std::string> items;
+  size_t start = 0;
+  while (start <= body.size()) {
+    size_t comma = body.find(',', start);
+    if (comma == std::string::npos) {
+      comma = body.size();
+    }
+    const std::string item = Unquote(Trim(body.substr(start, comma - start)));
+    if (!item.empty()) {
+      items.push_back(item);
+    }
+    if (comma == body.size()) {
+      break;
+    }
+    start = comma + 1;
+  }
+  return items;
+}
+
 /// 根据 CLI 传入路径解析最终配置文件路径。
 /// 空路径时默认返回当前目录下的 apm.yaml；传入目录则在目录内查找 apm.yaml。
 /// @param cli_config_path 命令行传入的配置路径（可为空、目录或文件路径）。
@@ -319,7 +347,11 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
          << defaults.runtime.soundbox.connect_timeout_ms << "\n"
          << "  llm_start_timeout_ms: 1000\n"
          << "  llm_stop_timeout_ms: 1000\n"
-         << "wakeup:\n"
+         << "  native_kws_triggers:\n";
+  for (const auto& trigger : defaults.runtime.soundbox.native_kws_triggers) {
+    output << "    - \"" << trigger << "\"\n";
+  }
+  output << "wakeup:\n"
          << "  say_hello: \"" << defaults.runtime.wakeup.say_hello << "\"\n"
          << "  keywords_file: \"" << defaults.runtime.wakeup.keywords_file << "\"\n"
          << "  tokens_path: \"" << defaults.runtime.wakeup.tokens_path << "\"\n"
@@ -375,6 +407,34 @@ void WriteDefaultConfig(const std::filesystem::path& config_file,
   }
 }
 
+/// 开始解析 YAML 序列配置，必要时清空默认列表。
+/// @param options 输出参数，当前流水线配置。
+/// @param key     YAML 序列键。
+/// @return 如果 key 是受支持的序列配置则返回 true。
+bool BeginConfigSequence(PipelineOptions* options, const std::string& key) {
+  if (key == "soundbox.native_kws_triggers") {
+    options->runtime.soundbox.native_kws_triggers.clear();
+    return true;
+  }
+  return false;
+}
+
+/// 解析 YAML 序列中的单个元素。
+/// @param options 输出参数，当前流水线配置。
+/// @param key     YAML 序列键。
+/// @param value   YAML 序列元素值。
+void ApplyConfigSequenceEntry(PipelineOptions* options,
+                              const std::string& key,
+                              const std::string& value) {
+  if (key == "soundbox.native_kws_triggers") {
+    if (!value.empty()) {
+      options->runtime.soundbox.native_kws_triggers.push_back(value);
+    }
+    return;
+  }
+  throw std::runtime_error("unknown config sequence key: " + key);
+}
+
 /// 解析 YAML 中的单个键值对，应用到 PipelineOptions 的对应字段。
 /// @param options 输出参数，当前流水线配置。
 /// @param key     YAML 键（可能带层级前缀，如 "aec.pre_aec_auto_gain.enabled"）。
@@ -398,6 +458,8 @@ void ApplyConfigEntry(PipelineOptions* options,
     options->runtime.soundbox.llm_start_timeout_ms = ParseInt(value, key);
   } else if (key == "soundbox.llm_stop_timeout_ms") {
     options->runtime.soundbox.llm_stop_timeout_ms = ParseInt(value, key);
+  } else if (key == "soundbox.native_kws_triggers") {
+    options->runtime.soundbox.native_kws_triggers = ParseStringList(value);
   } else if (key == "wakeup.say_hello") {
     options->runtime.wakeup.say_hello = value;
   } else if (key == "wakeup.keywords_file") {
@@ -493,8 +555,9 @@ void LoadConfigFile(const std::filesystem::path& config_file,
   }
 
   std::string line;
-  std::string section;     ///< 当前顶层 section（如 "aec"）。
-  std::string subsection;  ///< 当前子 section（如 "pre_aec_auto_gain"）。
+  std::string section;       ///< 当前顶层 section（如 "aec"）。
+  std::string subsection;    ///< 当前子 section（如 "pre_aec_auto_gain"）。
+  std::string sequence_key;  ///< 当前 YAML 序列键（如 "soundbox.native_kws_triggers"）。
   size_t line_number = 0;
   while (std::getline(input, line)) {
     ++line_number;
@@ -505,6 +568,21 @@ void LoadConfigFile(const std::filesystem::path& config_file,
       continue;
     }
 
+    const size_t indent = uncommented.find_first_not_of(" \t");
+    if (!content.empty() && content.front() == '-') {
+      if (sequence_key.empty()) {
+        throw std::runtime_error("config line " + std::to_string(line_number) +
+                                 " is a list item without a sequence key");
+      }
+      const std::string raw_item = Trim(content.substr(1));
+      if (raw_item.empty()) {
+        throw std::runtime_error("config line " + std::to_string(line_number) +
+                                 " has an empty list item");
+      }
+      ApplyConfigSequenceEntry(options, sequence_key, Unquote(raw_item));
+      continue;
+    }
+
     // 查找冒号分隔的键值对
     const size_t separator = content.find(':');
     if (separator == std::string::npos) {
@@ -512,7 +590,6 @@ void LoadConfigFile(const std::filesystem::path& config_file,
                                std::to_string(line_number) + ": " + content);
     }
 
-    const size_t indent = uncommented.find_first_not_of(" \t");
     const bool indented = indent > 0;
     const std::string raw_key = Trim(content.substr(0, separator));
     const std::string raw_value = Trim(content.substr(separator + 1));
@@ -525,15 +602,25 @@ void LoadConfigFile(const std::filesystem::path& config_file,
       if (!indented) {
         section = raw_key;
         subsection.clear();
+        sequence_key.clear();
         continue;
       }
       if (section.empty()) {
         throw std::runtime_error("config line " + std::to_string(line_number) +
                                  " is indented without a parent section");
       }
+      const std::string candidate_sequence_key = section + "." + raw_key;
+      if (BeginConfigSequence(options, candidate_sequence_key)) {
+        subsection.clear();
+        sequence_key = candidate_sequence_key;
+        continue;
+      }
       subsection = raw_key;
+      sequence_key.clear();
       continue;
     }
+
+    sequence_key.clear();
 
     // 构建完整的层级键名（e.g. aec.pre_aec_auto_gain.enabled）
     std::string key = raw_key;
