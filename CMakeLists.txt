@@ -350,10 +350,12 @@ set_tests_properties(audio_processing_module_tests PROPERTIES
 )
 
 add_custom_target(tests
-  COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+  COMMAND "$<TARGET_FILE:audio_processing_module_tests>"
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-  COMMENT "Running tests via ctest"
+  COMMENT "Running tests"
+  USES_TERMINAL
 )
+add_dependencies(tests audio_processing_module_tests)
 
 add_custom_target(distclean
   COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}" --target clean

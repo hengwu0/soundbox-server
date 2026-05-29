@@ -213,10 +213,18 @@ flowchart TD
 
 ## 编译构建
 
+本项目需在 Debian 13 上构建。构建前先安装依赖：
+
+```sh
+apt install build-essential cmake python3 ninja-build pkg-config libssl-dev zlib1g-dev
+```
+
+依赖安装完成后执行构建：
+
 ```sh
 cmake -S . -B .
 cmake --build .
-ctest --output-on-failure
+make tests
 ```
 
 构建过程会优先从 `third_party/archives` 中准备并集成以下内置依赖：WebRTC APM、ixwebsocket、nlohmann_json、spdlog 和 sherpa-onnx。若某个源码包在 `third_party/archives` 中不存在，构建脚本才会根据 `third_party/downloads` 中记录的 URL 下载，并缓存回 `third_party/archives`。
@@ -421,7 +429,7 @@ FileAudioStreamFrontend -> AEC（AudioSink -> FileRecorder WAV）-> MD5
 
 运行测试：
 ```sh
-ctest --output-on-failure
+make tests
 ```
 
 如果 WebRTC APM 的代码或参数有意发生了变更，需要从新的 WAV 输出重新生成 `expected_aec_processed.md5`，并记录变更原因。
@@ -447,7 +455,7 @@ frontend websocket 连接
 
 使用常规测试命令运行：
 ```sh
-ctest --output-on-failure
+make tests
 ```
 
 ## 常见故障排查

@@ -373,7 +373,11 @@ class MockSoundboxWebSocketServer {
         {"event", "instruction"},
         {"data", {{"NewLine", instruction_line.dump()}}},
     };
-    SendToAll(event.dump(), false);
+    const auto clients = server_.getClients();
+    Require(!clients.empty(), "mock soundbox websocket has no connected clients");
+    for (const auto& client : clients) {
+      client->send(event.dump(), false);
+    }
   }
 
  private:
@@ -2000,17 +2004,53 @@ int main() {
   size_t passed = 0;
   size_t failed = 0;
   for (const auto& [name, test] : tests) {
-    std::cerr << "[ RUN      ] " << name << '\n';
+    std::cerr << "[  RUNNING ] " << name << '\r' << std::flush;
+
+    // Redirect stdout and stderr to capture logs
+    const int stdout_fd = dup(STDOUT_FILENO);
+    const int stderr_fd = dup(STDERR_FILENO);
+    const std::string capture_path = "/tmp/test_capture_" + std::to_string(getpid()) + ".log";
+    const int capture_fd = open(capture_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    dup2(capture_fd, STDOUT_FILENO);
+    dup2(capture_fd, STDERR_FILENO);
+    close(capture_fd);
+
+    bool test_passed = false;
+    std::string error_message;
     try {
       test();
-      ++passed;
-      std::cerr << "[       OK ] " << name << '\n';
+      test_passed = true;
     } catch (const std::exception& error) {
-      ++failed;
-      std::cerr << "[  FAILED  ] " << name << ": " << error.what() << '\n';
+      error_message = error.what();
     } catch (...) {
+      error_message = "unknown exception";
+    }
+
+    // Restore stdout and stderr
+    fflush(stdout);
+    fflush(stderr);
+    dup2(stdout_fd, STDOUT_FILENO);
+    dup2(stderr_fd, STDERR_FILENO);
+    close(stdout_fd);
+    close(stderr_fd);
+
+    if (test_passed) {
+      ++passed;
+      std::cerr << "[  PASSED  ] " << name << '\n';
+      unlink(capture_path.c_str());
+    } else {
       ++failed;
-      std::cerr << "[  FAILED  ] " << name << ": unknown exception" << '\n';
+      std::cerr << "[  FAILED  ] " << name;
+      if (!error_message.empty()) {
+        std::cerr << ": " << error_message;
+      }
+      std::cerr << '\n';
+      // Dump captured logs
+      std::ifstream capture(capture_path);
+      if (capture.good()) {
+        std::cerr << capture.rdbuf();
+      }
+      unlink(capture_path.c_str());
     }
   }
 
@@ -2020,6 +2060,6 @@ int main() {
     std::cerr << "[  FAILED  ] " << failed << " tests." << '\n';
     return EXIT_FAILURE;
   }
-  std::cerr << "[       OK ] All tests passed." << '\n';
+  std::cerr << "[      OK  ] All tests passed." << '\n';
   return EXIT_SUCCESS;
 }
