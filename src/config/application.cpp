@@ -665,7 +665,6 @@ void LoadConfigFile(const std::filesystem::path& config_file,
 PipelineOptions DefaultPipelineOptions() {
   PipelineOptions options;
   options.socket_dir = DefaultSocketDir();
-  options.runtime.soundbox.ws_url.clear();
   options.runtime.log.file_path = "logs/soundbox_server.log";
   return options;
 }
