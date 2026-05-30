@@ -599,6 +599,11 @@ void Frontend::HandleSessionStart(const Event& event) {
     SetState(State::kSessionStarted, "llm_start_ok");
     return;
   }
+  // LLM raw 通道启用失败：xiaozhi session_start 已经发送成功，
+  // 这里补发 session_end，避免上游会话悬空。
+  if (llm_client_ && !llm_client_->SendSessionEnd("llm_start_failed", "soundbox-server")) {
+    kLog->warn("failed to send llm_start_failed session_end to xiaozhi");
+  }
   // LLM raw 通道启用失败：回到空闲状态继续等待下一次唤醒
   SetState(State::kSessionStopped, "llm_start_failed");
 }

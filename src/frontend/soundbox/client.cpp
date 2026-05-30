@@ -250,6 +250,9 @@ bool SoundBoxClient::NotifyLlmStart() {
                        ConfiguredTimeout(cfg_.soundbox.llm_start_timeout_ms, 1000),
                        &response);
   if (ok && response.value("msg", std::string()) == "llm_start_ok") {
+    // 切换到 LLM raw 双通道前清空旧的 KWS 单声道积压包，
+    // 避免 AudioRouter 在 LlmWorking 状态下把切换边界的 1ch 数据送入 AEC。
+    audio_pipe_.Clear();
     mode_controller_.ForceEnter(AudioMode::LlmWorking, "llm_start_ok");
     return true;
   }
@@ -286,6 +289,9 @@ bool SoundBoxClient::NotifyLlmStop() {
       Call("llm_stop", nullptr,
            ConfiguredTimeout(cfg_.soundbox.llm_stop_timeout_ms, 1000), &response);
   if (ok && response.value("msg", std::string()) == "llm_stop_ok") {
+    // 切回 KWS 单声道前清空旧的 LLM 双声道积压包，
+    // 避免 AudioRouter 在 Kws 状态下把切换边界的 2ch 数据送入 KWS。
+    audio_pipe_.Clear();
     mode_controller_.ForceEnter(AudioMode::Kws, "llm_stop_ok");
     return true;
   }
